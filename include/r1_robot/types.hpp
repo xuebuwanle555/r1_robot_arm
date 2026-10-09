@@ -95,6 +95,8 @@ struct JointState {
 /// Snapshot of the whole arm.  `valid[i] == false` means "do not trust
 /// joint i", which blocks every actuating command (see SafetyMonitor).
 struct RobotState {
+  /// Age of the NEWEST valid frame of the *stalest* joint (see
+  /// joint_stamp_ns).  0 means "no timestamp available at all".
   std::uint64_t stamp_ns = 0;
   JointVector q{};
   JointVector dq{};
@@ -104,6 +106,12 @@ struct RobotState {
   std::array<ControlMode, kNumJoints> mode{};
   std::array<std::uint32_t, kNumJoints> error_code{};
   JointFlags valid{};
+  /// Per-joint time at which the newest valid feedback frame for that joint was
+  /// RECEIVED [ns, monotonic].  0 means "no valid frame ever received".
+  ///
+  /// This must be the reception time, never the time `readState()` was called:
+  /// stamping a state at read time makes every freshness check vacuous.
+  std::array<std::uint64_t, kNumJoints> joint_stamp_ns{};
   bool connected = false;
 
   bool allValid() const;
@@ -111,6 +119,10 @@ struct RobotState {
   bool allFinite() const;
   bool anyError() const;
   double minSupplyVoltage() const;
+
+  /// Reception timestamp for `joint`, falling back to the global `stamp_ns`
+  /// when the backend does not provide per-joint stamps.
+  std::uint64_t jointStampNs(int joint) const;
 };
 
 /// Monotonic clock in nanoseconds (steady_clock based).

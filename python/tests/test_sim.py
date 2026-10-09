@@ -33,8 +33,8 @@ except Exception as _exc:  # pragma: no cover - missing optional dependency
     HAVE_SIM = False
     _SIM_ERROR = _exc
 
-# A pose inside the soft-limit margins (J2/J4 must stay above 0.05 rad).
-HOME = np.array([0.0, 0.3, 0.3, 0.3, 0.0, 0.0, 0.0])
+# Poses are centralised in r1_robot.poses (safe home / sim initial pose).
+HOME = rr.SAFE_HOME
 GOAL = np.array([0.2, 0.5, 0.1, 0.4, -0.2, 0.1, 0.2])
 
 

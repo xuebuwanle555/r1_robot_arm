@@ -1,0 +1,91 @@
+--- a/include/arm_motor_bus.h
++++ b/include/arm_motor_bus.h
+@@ -105,6 +105,23 @@
+     /** True if every joint has received at least one valid feedback. */
+     bool allFeedbackReady() const;
+ 
++    /**
++     * Per-joint feedback reception statistics.
++     *
++     * PATCHED ADDITION (not present upstream).  The upstream class only exposes
++     * a sticky `feedbackReady()` boolean, which cannot distinguish "receiving
++     * continuously" from "stopped receiving after the first packet", and it
++     * exposes no reception timestamp at all.  These counters/timestamps let a
++     * caller detect stale feedback and stamp a state with the time the data
++     * actually arrived instead of the time it was read.
++     */
++    struct FeedbackStats {
++        uint64_t packets = 0;   //!< valid (CRC-checked) packets received
++        bool received = false;  //!< packets > 0
++        uint64_t age_ns = 0;    //!< time since the last valid packet (0 if none)
++    };
++    std::array<FeedbackStats, kArmJointCount> feedbackStats() const;
++
+ private:
+     struct Impl;
+     std::unique_ptr<Impl> impl_;
+--- a/src/arm_motor_bus.cpp
++++ b/src/arm_motor_bus.cpp
+@@ -16,6 +16,14 @@
+ 
+ namespace {
+ 
++/** PATCHED: monotonic nanoseconds (same clock family as std::chrono::steady_clock). */
++uint64_t steadyNowNs() {
++    return static_cast<uint64_t>(
++        std::chrono::duration_cast<std::chrono::nanoseconds>(
++            std::chrono::steady_clock::now().time_since_epoch())
++            .count());
++}
++
+ float safeDir(float dir) {
+     return (std::fabs(dir) < 1e-6f) ? 1.f : dir;
+ }
+@@ -55,6 +63,9 @@
+     mutable std::mutex fb_mutex;
+     std::array<ArmJointState, kArmJointCount> latest_motor{};  // raw motor frame
+     std::array<bool, kArmJointCount> fb_ready{};
++    // PATCHED: per-joint reception statistics (not present upstream).
++    std::array<uint64_t, kArmJointCount> rx_count{};
++    std::array<uint64_t, kArmJointCount> last_rx_ns{};
+     bool opened = false;
+     std::string port;
+     int baudrate = kArmDefaultBaudrate;
+@@ -91,6 +102,9 @@
+         latest_motor[joint].timeout = fb->timeout;
+         latest_motor[joint].error_code = fb->error_code;
+         fb_ready[joint] = true;
++        // PATCHED: record when this frame actually arrived.
++        last_rx_ns[joint] = steadyNowNs();
++        ++rx_count[joint];
+     }
+ 
+     void softStopAll() {
+@@ -141,6 +155,8 @@
+         std::lock_guard<std::mutex> lock(impl_->fb_mutex);
+         impl_->latest_motor = {};
+         impl_->fb_ready = {};
++        impl_->rx_count = {};
++        impl_->last_rx_ns = {};
+     }
+     impl_->opened = true;
+     std::cout << "[ArmMotorBus] opened " << port << " @ " << baudrate
+@@ -379,3 +395,18 @@
+     }
+     return true;
+ }
++
++std::array<ArmMotorBus::FeedbackStats, kArmJointCount> ArmMotorBus::feedbackStats() const {
++    // PATCHED: report per-joint reception time/counter instead of a sticky flag.
++    std::lock_guard<std::mutex> lock(impl_->fb_mutex);
++    std::array<FeedbackStats, kArmJointCount> out{};
++    const uint64_t now = steadyNowNs();
++    for (int i = 0; i < kArmJointCount; ++i) {
++        out[i].packets = impl_->rx_count[i];
++        out[i].received = impl_->rx_count[i] > 0;
++        out[i].age_ns = (out[i].received && now >= impl_->last_rx_ns[i])
++                            ? (now - impl_->last_rx_ns[i])
++                            : 0;
++    }
++    return out;
++}

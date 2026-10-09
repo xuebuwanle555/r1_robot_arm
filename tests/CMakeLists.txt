@@ -7,6 +7,7 @@
 add_executable(r1_robot_tests
   test_main.cpp
   test_config.cpp
+  test_feedback_freshness.cpp
   test_gripper.cpp
   test_hardware_gate.cpp
   test_mock_arm.cpp
@@ -31,6 +32,6 @@ endif()
 add_test(NAME r1_robot_all COMMAND r1_robot_tests)
 
 # Per-suite entries so `ctest -R safety` works.
-foreach(suite limits safety mock_arm r1_arm gripper config motion_gate)
+foreach(suite limits safety mock_arm r1_arm gripper config motion_gate freshness)
   add_test(NAME r1_robot_${suite} COMMAND r1_robot_tests --filter ${suite})
 endforeach()

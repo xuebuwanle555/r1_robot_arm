@@ -25,15 +25,23 @@
 //   * Motors only transmit feedback after receiving a control packet, so the
 //     first frames must be probed (phase-2 bring-up, see HARDWARE_BRINGUP.md).
 //   * The SDK default port is /dev/ttyUSB3 at 6 Mbaud, joint i <-> motor id i.
+//   * Upstream exposes only a sticky `feedbackReady()` flag and no reception
+//     timestamp.  r1_robot therefore builds the SDK from a minimal, documented
+//     patch (patches/0001-arm_motor_bus-feedback-stats.patch) that adds
+//     `feedbackStats()`; the submodule itself stays untouched.  A state must be
+//     stamped with the time a frame was RECEIVED, never with the time it was
+//     read - otherwise every freshness check is vacuous.
 //
 // 待验证: real bus voltage, achievable control rate, feedback latency, whether
 // `timed_out` should be true or false for a given application.
 // ---------------------------------------------------------------------------
 
+#include <functional>
 #include <memory>
 #include <string>
 
 #include "r1_robot/backend.hpp"
+#include "r1_robot/joint_bus.hpp"
 #include "r1_robot/motion_gate.hpp"
 
 namespace r1_robot {
@@ -44,6 +52,11 @@ struct UnitreeBackendConfig {
   /// Path to joint_calib.txt.  Relative paths resolve against the CWD, exactly
   /// like the official examples.
   std::string calib_path = "config/joint_calib.txt";
+
+  /// Test seam: build the transport used by this backend.  Empty (the default)
+  /// means "use the real SDK bus".  Tests inject a fake bus so delivery loss,
+  /// partial joint failure and port disconnects can be exercised offline.
+  std::function<JointBusPtr()> bus_factory;
 };
 
 class UnitreeArmBackend final : public IArmBackend {

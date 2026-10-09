@@ -58,6 +58,69 @@ def _minimum_jerk(tau: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     return s, ds
 
 
+#: Exact peak of |s'| for the minimum-jerk profile above (at τ = 1/2).
+MIN_JERK_PEAK_VELOCITY = 1.875
+#: Exact peak of |s''| for the minimum-jerk profile (at τ = (1 ± 1/√3)/2).
+MIN_JERK_PEAK_ACCELERATION = 10.0 / np.sqrt(3.0)
+
+#: Conservative default acceleration cap used when the caller does not supply
+#: one [rad/s^2].  TODO(bringup): derive the real value from the actuator and
+#: power budget; the URDF has no acceleration limit.
+DEFAULT_MAX_ACCELERATION = 21.0
+
+
+@dataclass
+class TrajectoryLimits:
+    """Per-joint motion limits for a trajectory.
+
+    ``max_velocity`` comes from the URDF (`velocity` attribute).
+    ``max_acceleration`` has no URDF equivalent and is a conservative default
+    until it is measured on hardware (HARDWARE_UNVERIFIED).
+    """
+
+    max_velocity: np.ndarray
+    max_acceleration: np.ndarray
+
+    @classmethod
+    def from_urdf_defaults(cls, max_acceleration=None) -> "TrajectoryLimits":
+        from .limits import R1_MAX_VELOCITY
+
+        accel = (
+            np.full(NUM_JOINTS, DEFAULT_MAX_ACCELERATION)
+            if max_acceleration is None
+            else np.asarray(max_acceleration, dtype=np.float64).reshape(NUM_JOINTS)
+        )
+        return cls(
+            max_velocity=np.asarray(R1_MAX_VELOCITY, dtype=np.float64).copy(),
+            max_acceleration=accel,
+        )
+
+
+def required_segment_duration(
+    delta_q: np.ndarray,
+    max_velocity: np.ndarray,
+    max_acceleration: np.ndarray,
+    safety_factor: float = 1.0,
+) -> float:
+    """Shortest minimum-jerk segment duration meeting every joint's limits.
+
+    For a minimum-jerk segment of duration T covering ``delta_q``:
+        peak |dq| = 1.875 * |delta_q| / T
+        peak |ddq| = 10/√3 * |delta_q| / T²
+    so T must satisfy both.  The slowest joint decides.
+    """
+    dq = np.abs(np.asarray(delta_q, dtype=np.float64))
+    vmax = np.asarray(max_velocity, dtype=np.float64)
+    amax = np.asarray(max_acceleration, dtype=np.float64)
+    if np.any(vmax <= 0.0) or np.any(amax <= 0.0):
+        raise ValueError("velocity/acceleration limits must be positive")
+
+    t_v = float(np.max(MIN_JERK_PEAK_VELOCITY * dq / vmax))
+    t_a = float(np.max(np.sqrt(MIN_JERK_PEAK_ACCELERATION * dq / amax)))
+    base = max(t_v, t_a)
+    return base if base <= 0.0 else base * max(1.0, safety_factor)
+
+
 @dataclass
 class JointTrajectory:
     """Piecewise minimum-jerk trajectory through joint-space waypoints.
@@ -125,6 +188,86 @@ class JointTrajectory:
             return q0 + (q1 - q0) * s[0]
         dt = self.times[idx + 1] - self.times[idx]
         return (q1 - q0) * (ds[0] / dt)
+
+    # -- velocity / acceleration limits -------------------------------------
+    def segment_durations(self) -> list[float]:
+        return [
+            self.times[i + 1] - self.times[i] for i in range(len(self.times) - 1)
+        ]
+
+    def time_scale_for(
+        self, limits: TrajectoryLimits, safety_factor: float = 1.0
+    ) -> float:
+        """Smallest uniform time scale >= 1 that keeps the profile inside limits.
+
+        Scaling every waypoint time by this factor is the *minimum* slowdown;
+        the profile shape (and therefore smoothness) is unchanged.
+        """
+        if len(self.times) < 2:
+            return 1.0
+        scale = 1.0
+        for i in range(len(self.times) - 1):
+            duration = self.times[i + 1] - self.times[i]
+            if duration <= 0.0:
+                continue
+            required = required_segment_duration(
+                self.positions[i + 1] - self.positions[i],
+                limits.max_velocity,
+                limits.max_acceleration,
+                safety_factor,
+            )
+            if required > duration:
+                scale = max(scale, required / duration)
+        return scale
+
+    def scaled_to(
+        self, limits: TrajectoryLimits, safety_factor: float = 1.0
+    ) -> "JointTrajectory":
+        """A copy of this trajectory stretched in time to respect `limits`."""
+        scale = self.time_scale_for(limits, safety_factor)
+        out = JointTrajectory()
+        for t, q in zip(self.times, self.positions):
+            out.add(t * scale, q)
+        return out
+
+    def limit_violations(
+        self, limits: TrajectoryLimits, samples_per_segment: int = 400
+    ) -> list[str]:
+        """Dense numerical check of the profile against the limits.
+
+        Independent of the analytic scaling: it samples the actual profile, so a
+        bug in `required_segment_duration` cannot hide behind it.
+        """
+        vmax = np.asarray(limits.max_velocity, dtype=np.float64)
+        amax = np.asarray(limits.max_acceleration, dtype=np.float64)
+        problems: set[str] = set()
+        for i in range(len(self.times) - 1):
+            t0, t1 = self.times[i], self.times[i + 1]
+            if t1 <= t0:
+                continue
+            h = (t1 - t0) / samples_per_segment
+            for k in range(samples_per_segment + 1):
+                t = t0 + k * h
+                v = self.sample_velocity(t)
+                t_lo = max(t - h, t0)
+                t_hi = min(t + h, t1)
+                if t_hi <= t_lo:
+                    continue
+                a = (self.sample_velocity(t_hi) - self.sample_velocity(t_lo)) / (
+                    t_hi - t_lo
+                )
+                for j in range(NUM_JOINTS):
+                    if abs(v[j]) > vmax[j] * (1.0 + 1e-6):
+                        problems.add(
+                            f"segment {i} joint {j}: |dq|={abs(v[j]):.4f} > "
+                            f"limit {vmax[j]:.4f} rad/s"
+                        )
+                    if abs(a[j]) > amax[j] * (1.0 + 1e-6):
+                        problems.add(
+                            f"segment {i} joint {j}: |ddq|={abs(a[j]):.4f} > "
+                            f"limit {amax[j]:.4f} rad/s^2"
+                        )
+        return sorted(problems)
 
 
 @dataclass

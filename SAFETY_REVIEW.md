@@ -14,13 +14,14 @@ No safety check was removed or weakened to make anything pass.
 | # | Question | Verdict |
 |---|----------|---------|
 | 1 | Can a motion command bypass `SafetyMonitor`? | **2 holes found → fixed** |
-| 2 | Do calibration / direction / gearing / Kp-Kd-tau units match the SDK? | Logical mapping verified; values `HARDWARE_UNVERIFIED` |
-| 3 | Can state feedback be stale? Timestamps & thread safety? | Stale detection is a **real gap** on the unitree backend; R1Arm race **fixed** |
+| 2 | Do calibration / direction / gearing / Kp-Kd-tau units match the SDK? | Mapping verified; realized gains `HARDWARE_UNVERIFIED` |
+| 3 | Can state feedback be stale? Timestamps & thread safety? | **Real gap → fixed** (documented SDK patch); R1Arm race **fixed** |
 | 4 | Does the low-level controller watchdog on its own? | Yes by design; timing `HARDWARE_UNVERIFIED` |
 | 5 | Are stop / FOC-hold / zero-torque / disable conflated? | No; distinguished + tested |
-| 6 | Are trajectory timeout / not-reached / motor-fault detected? | No layer existed → **added + tested** |
+| 6 | Are trajectory timeout / not-reached / motor-fault detected? | Added + tested |
 | 7 | Does the read-only diagnostic tool change motor modes? | No (only an explicit, twice-confirmed `--probe`) |
 | 8 | Can the "no real hardware by default" rule be bypassed via the backend? | Yes before → **fixed** (backend-level gate) |
+| 9 | Can Python drive real hardware? Where does safety authority live? | No Python hardware path; authority is C++; **guarded by a test** |
 
 ---
 
@@ -85,11 +86,16 @@ Verified by reading the SDK sources (`third_party/r1-7a_sdk/src/arm_motor_bus.cp
   with `offset`: `urdf = dir*scale*motor + offset`. `r1_robot` passes URDF-frame
   values in and receives URDF-frame values out — the motor frame never leaks
   above the backend. ✔
-* `kp`/`kd` are **passed through unchanged**. This is correct for joint-frame
-  stiffness/damping: with `τ_motor = kp·(q_err,motor)` and
-  `q_err,motor = q_err,urdf / (dir·scale)`, the joint torque is
-  `τ_joint = (dir·scale)·τ_motor = kp·q_err,urdf`. The same holds for `kd`. So
-  the *joint-frame* gains equal the packet gains; no hidden `scale²` factor. ✔
+* `kp`/`kd` are **passed through unchanged by `ArmMotorBus`**, but the wire
+  encoding in `MotorProtocol::buildControlPacket()` divides them by `ratio²`
+  (and scales position by `ratio`, velocity by `ratio`, torque by `1/ratio`).
+  The gear ratio is applied exactly **once**, inside the protocol layer; `scale`
+  is a calibration scale on top of the output-side value, not a second ratio.
+  What the motor firmware does with the `kp/(ratio²)` number is **not in this
+  repository**, so the *realized* joint stiffness is **`HARDWARE_UNVERIFIED`**.
+  Do not assume the value handed to `ArmJointCmd.kp` equals the stiffness the
+  joint exhibits; the configured `max_kp`/`max_kd` bound the *commanded* value
+  only.  (This corrects a too-optimistic claim made earlier in this document.)
 * `scale` is `1.0` in the SDK example calibration and `dir` is ±1; the IM6014
   reduction ratio is handled inside the motor firmware and is **not** exposed by
   the SDK, so `r1_robot` cannot (and must not) apply it again. ✔
@@ -115,24 +121,44 @@ with no synchronization, so a control thread and a UI/status thread could race.
 `safetyConfig()` and `backend()` return **by value** (no dangling reference
 under lock), and all mutating paths lock. A multithreaded stress test was added.
 
-### 3b. Stale feedback on the real backend (real gap — `HARDWARE_UNVERIFIED`)
+### 3b. Stale feedback on the real backend (FIXED, with a documented SDK patch)
 
-`MockArm` reports honest timestamps (and `feedback_delay_s` can force staleness);
-`SafetyMonitor::checkState` correctly faults on `state.stale_feedback` — this is
-covered by tests.
+The original gap: upstream `ArmMotorBus` exposes only a **sticky** `fb_ready[]`
+flag (set once, never cleared) and **no reception timestamp**, and the backend
+stamped the state at read time — so a bus that died after the first frame looked
+identical to a healthy one and the freshness check was vacuous.
 
-The **unitree** backend cannot currently detect staleness:
+**Confirmed by reading the SDK:** `MotorProtocol::parseFeedbackPacket()` returns
+only parsed values; `SerialPort`'s receive callback carries no timestamp;
+`ArmMotorBus::Impl::onPacket()` only sets `fb_ready[joint] = true`.  There is no
+per-joint reception time, sequence number or counter anywhere.
 
-* the SDK's `fb_ready[]` flag is set once on the first packet and **never
-  cleared**, so `RobotState::valid` is sticky `true` even if the bus dies;
-* the SDK exposes no per-frame reception timestamp, so `readState()` stamps the
-  state at read time (`nowNs()`), which makes the freshness check vacuous.
+**Fix.** A minimal, versioned patch
+(`patches/0001-arm_motor_bus-feedback-stats.patch`, sha256 printed at configure
+time) adds `ArmMotorBus::FeedbackStats { packets, received, age_ns }` and
+`feedbackStats()`, recording `steady_clock` reception time + packet count in
+`onPacket`.  The submodule is **never modified**: CMake copies the two touched
+files into `<build>/sdk_patched`, applies the patch there, verifies
+`feedbackStats()` exists, and compiles the copy.  `SdkJointBus` adapts it to the
+SDK-free `IJointBus` interface.
 
-**Status: `HARDWARE_UNVERIFIED`, open.** Closing it needs a reception counter or
-timestamp from the SDK; the SDK is read-only, so this cannot be fixed in
-`r1_robot` alone. Tracked as a TODO in `src/unitree_backend.cpp`. Until then, do
-not treat `state.valid == true` on real hardware as proof that feedback is
-current.
+`UnitreeArmBackend::readState()` now derives each joint's timestamp as
+`now - age_ns` (the real reception time, **never the read time**) and publishes
+`RobotState::joint_stamp_ns[i]`; the global `stamp_ns` becomes the stalest
+joint's, so the existing global check still catches a single silent joint.
+`SafetyMonitor` adds a per-joint fault `state.joint_stale_feedback` naming the
+joint — but only for backends that actually publish per-joint stamps, so those
+that cannot are not double-reported.
+
+**Tests** (`tests/test_feedback_freshness.cpp`, fake bus injected through
+`UnitreeBackendConfig::bus_factory`): reception-time stamping (and that it does
+*not* advance when no frame arrives), the freshness budget boundary, partial
+joint loss (named joint), a never-received joint, CRC-rejected frames, motor
+errors, port disconnect (reported as not-connected, actuation refused, stop still
+allowed), and **recovery never re-arms motion**.
+
+**Still `HARDWARE_UNVERIFIED`:** the real frame rate, latency and the correct
+`max_feedback_age_s` for a 6 Mbaud half-duplex bus must be measured on hardware.
 
 ---
 
@@ -200,17 +226,73 @@ cached `states()` (no bus writes). ✔ No change needed.
 
 ---
 
+## 9. Python / C++ control boundary (P2 review)
+
+**Where safety authority lives.** All motion gating, the arming latch, the
+safety monitor and the bus I/O are **C++** (`r1_robot_core` +
+`r1_robot_unitree_backend`). Python owns *planning*: it produces joint targets
+and trajectories; it does not own the hardware control loop or its timing.
+
+* **Python cannot drive real hardware today.** The only Python backends are
+  `MockArm` (simulation) and `SimArm` (MuJoCo, `is_real_hardware == False`), plus
+  `NullBackend`, whose `is_real_hardware` is `True` but whose every method
+  raises. There is no Python serial/SDK path at all. Guarded by
+  `tests/test_trajectory.py::TestNoPythonHardwarePath`.
+* **`TrajectoryExecutor` never talks to a backend directly.** It takes an
+  `R1Robot` and sends every frame through `R1Robot.send_action()`, so the soft
+  limits, gain/torque envelope, anti-step rule, freshness and motor-error checks
+  all apply. It cannot arm motion: the caller must call
+  `enable_motion(human_confirmed=True)`.
+* **Interface parity.** `MockArm`, `SimArm` and the C++ `IArmBackend` expose the
+  same logical surface (`name`, `is_real_hardware`, `connect`, `read_state`,
+  `write_command`, `stop`, calibration, `advance` for deterministic time). The
+  differences that matter: `SimArm` uses MuJoCo physics while `MockArm` uses a
+  one-line-per-joint model; `MockArm`/`SimArm` report voltage and temperature,
+  the real SDK does not; only the real backend has an arming gate and a serial
+  transport.
+* **Real-hardware mode remains human-gated.** `allow_real_hardware` defaults to
+  `false`; `enableMotion(human_confirmed=true)` is required; the backend gate is
+  armed only there. Nothing in Python can bypass this — see §1a and §8.
+
+**Required for real hardware (not implemented here).** A real device must be
+driven by a **dedicated C++ control service** that owns the real-time loop, the
+watchdog policy and the fault arbitration; Python becomes a client that submits
+targets and trajectories over a link that cannot command motors directly. Phase
+1/2 deliberately stops at "the C++ library can do this correctly"; the service
+is phase-3 work.
+
+**Timing.** The MuJoCo timestep (2 ms / 500 Hz) is a *simulation* choice and says
+nothing about the real command rate. `ArmMotorBus::step()` sleeps 115 µs after
+every joint write — a ≥ 805 µs floor per 7-joint frame before serial time and
+motor turnaround — so a 500 Hz real loop must not be assumed; it must be
+measured (`test_dynamics.py::TestControlFrequencyAssumptions` documents the
+arithmetic).
+
+---
+
 ## Open risks (`HARDWARE_UNVERIFIED`)
 
-1. **Stale-feedback detection on the real bus** (§3b) — the most important open
-   item; needs SDK support for a reception counter/timestamp.
-2. **Calibration values** (`dir/scale/offset`) and joint direction signs (§2).
-3. **Effort / velocity limits** are the URDF values, not verified against the
-   actuators and power supply (§2); the safety envelopes
-   `max_kp/kd/tau/velocity`, `min_supply_voltage` and `max_feedback_age_s` are
-   conservative placeholders.
-4. **Watchdog timing** (§4).
-5. **Voltage/temperature** are not exposed by the SDK, so the undervoltage check
-   is inert on real hardware (only the motor error bit `0x8` is usable).
-6. Soft-limit zero pose: J2/J4 cannot be commanded to `q = 0` under the default
-   margin — a UX constraint to respect in any trajectory (§2 of `SIMULATION.md`).
+1. **Realized joint gains.** `kp`/`kd` reach the wire divided by `ratio²` inside
+   `MotorProtocol`; the firmware's interpretation is not in the repository, so
+   the effective stiffness/damping must be measured on hardware (§2, §3 of
+   `JOINT_MAPPING.md`).
+2. **Calibration values** (`dir/scale/offset`) and joint direction signs. `dir`
+   cannot be derived from the URDF axis sign — it must come from
+   `calibrate_joints`; do not guess (`JOINT_MAPPING.md` §4).
+3. **Freshness budget / real bus timing.** The mechanism is now correct, but
+   frame rate, latency and a safe `max_feedback_age_s` for the 6 Mbaud
+   half-duplex bus must be measured (§3b).
+4. **Effort / velocity limits** are the URDF values, not verified against the
+   actuators and power supply; the envelopes `max_kp/kd/tau/velocity`,
+   `min_supply_voltage` and `max_feedback_age_s` are conservative placeholders.
+5. **Watchdog timing** (§4).
+6. **Voltage/temperature** are parsed by `MotorProtocol` but dropped by
+   `ArmMotorBus`, so the undervoltage check is inert on real hardware (only motor
+   error bit `0x8` is usable). Closing this needs a further SDK patch.
+7. **Self-collision is not validated.** Deeply folded poses of this URDF produce
+   **no** self-contact in MuJoCo, so collision limits could not be exercised;
+   mirrored in `test_dynamics.py::test_no_self_collision_is_detected_in_folded_poses`.
+8. Soft-limit zero pose: J2/J4 cannot be commanded to `q = 0` under the default
+   margin — a constraint to respect in any trajectory (`JOINT_MAPPING.md` §1).
+9. `SAFE_HOME` is simulation-validated only; cable routing, fixtures, brake
+   behaviour and real self-collision are not covered (`JOINT_MAPPING.md` §2).

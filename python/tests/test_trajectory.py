@@ -17,8 +17,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import r1_robot as rr  # noqa: E402
 
-# A pose inside the soft-limit margins (J2/J4 must stay above 0.05 rad).
-HOME = np.array([0.0, 0.3, 0.3, 0.3, 0.0, 0.0, 0.0])
+# Poses are centralised in r1_robot.poses (safe home / sim initial pose).
+HOME = rr.SAFE_HOME
 GOAL = np.array([0.2, 0.5, 0.1, 0.4, -0.2, 0.1, 0.2])
 
 
@@ -145,6 +145,112 @@ class TestExecutorOutcomes(unittest.TestCase):
                 robot,
                 rr.JointTrajectory.from_waypoints([(0.0, HOME), (0.5, GOAL)]),
                 tau_ff=lambda q: np.zeros(3),
+            )
+
+
+class TestTrajectoryLimits(unittest.TestCase):
+    """Joint velocity / acceleration limits and automatic time scaling."""
+
+    def _limits(self):
+        return rr.TrajectoryLimits.from_urdf_defaults()
+
+    def test_required_duration_satisfies_both_limits(self):
+        dq = np.full(7, 0.4)
+        vmax = np.full(7, 1.0)
+        amax = np.full(7, 4.0)
+        t = rr.required_segment_duration(dq, vmax, amax)
+        # Velocity needs 1.875*0.4/1.0 = 0.75 s; acceleration needs
+        # sqrt(10/sqrt(3)*0.4/4) = 0.76 s.  The slower one wins.
+        self.assertGreaterEqual(t, 0.75)
+        self.assertGreaterEqual(t, 0.759)
+        self.assertAlmostEqual(t, 0.7599, places=3)
+
+    def test_a_fast_trajectory_is_slowed_down_to_meet_the_limits(self):
+        limits = self._limits()
+        fast = rr.JointTrajectory.from_waypoints([(0.0, HOME), (0.1, GOAL)])
+        self.assertTrue(fast.limit_violations(limits), "profile should violate")
+
+        scaled = fast.scaled_to(limits)
+        self.assertGreater(scaled.duration, fast.duration)
+        self.assertEqual(scaled.limit_violations(limits), [])
+
+    def test_scaling_is_uniform_and_preserves_the_path(self):
+        limits = self._limits()
+        fast = rr.JointTrajectory.from_waypoints(
+            [(0.0, HOME), (0.2, GOAL), (0.4, HOME)]
+        )
+        scaled = fast.scaled_to(limits)
+        factor = scaled.duration / fast.duration
+        self.assertGreater(factor, 1.0)
+        # Uniform: every intermediate time is stretched by the same factor, so
+        # the geometric path (the sampled positions) is unchanged.
+        for t in np.linspace(0.0, fast.duration, 25):
+            self.assertTrue(
+                np.allclose(fast.sample(t), scaled.sample(t * factor), atol=1e-12)
+            )
+
+    def test_an_already_slow_trajectory_is_left_alone(self):
+        limits = self._limits()
+        slow = rr.JointTrajectory.from_waypoints([(0.0, HOME), (10.0, GOAL)])
+        self.assertEqual(slow.time_scale_for(limits), 1.0)
+        scaled = slow.scaled_to(limits)
+        self.assertAlmostEqual(scaled.duration, slow.duration)
+        self.assertEqual(scaled.limit_violations(limits), [])
+
+    def test_the_demonstration_trajectory_meets_a_conservative_limit_set(self):
+        limits = rr.TrajectoryLimits.from_urdf_defaults()
+        traj = rr.JointTrajectory()
+        for i, q in enumerate(rr.DEMO_TRAJECTORY_POSES):
+            traj.add(i * 1.5, q)
+        self.assertEqual(traj.limit_violations(limits), [])
+
+    def test_invalid_limits_are_rejected(self):
+        with self.assertRaises(ValueError):
+            rr.required_segment_duration(
+                np.full(7, 0.1), np.zeros(7), np.full(7, 4.0)
+            )
+
+
+class TestNoPythonHardwarePath(unittest.TestCase):
+    """P2 architecture guard: Python must not be able to drive real hardware.
+
+    Safety authority (gating, arming, watchdog arbitration, bus I/O) lives in
+    the C++ stack.  Python plans; it does not talk to a device.  These tests
+    fail if someone later adds a Python hardware path.
+    """
+
+    def test_the_package_exposes_no_real_hardware_backend(self):
+        for name in ("UnitreeBackend", "SerialArm", "RealArm", "HardwareArm"):
+            self.assertFalse(hasattr(rr, name), msg=f"unexpected {name} in Python")
+
+    def test_null_backend_refuses_everything(self):
+        backend = rr.NullBackend()
+        self.assertTrue(backend.is_real_hardware)  # honest about what it is
+        with self.assertRaises(NotImplementedError):
+            backend.connect()
+        with self.assertRaises(NotImplementedError):
+            backend.write_command(rr.ArmCommand.stop())
+        self.assertFalse(backend.is_connected)
+
+    def test_the_executor_requires_the_gated_robot_not_a_backend(self):
+        # TrajectoryExecutor must go through R1Robot so every safety check
+        # applies; handing it a bare backend must not work.
+        backend = rr.MockArm(rr.MockArmConfig())
+        backend.set_joint_positions(HOME)
+        executor = rr.TrajectoryExecutor(rr.ExecutorConfig(dt=0.002))
+        with self.assertRaises(AttributeError):
+            executor.run(backend, rr.JointTrajectory.from_waypoints([(0.0, HOME)]))
+
+    def test_a_backend_alone_cannot_arm_motion(self):
+        backend = rr.MockArm(rr.MockArmConfig())
+        backend.set_joint_positions(HOME)
+        robot = rr.R1Robot(backend=backend)
+        robot.connect()
+        self.assertFalse(robot.motion_enabled)
+        with self.assertRaises(PermissionError):
+            robot.send_action(
+                rr.ArmCommand.position(np.array([0.0, 0.3, 0.3, 0.3, 0.0, 0.0, 0.0]),
+                                       20.0, 3.0)
             )
 
 

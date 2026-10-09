@@ -51,6 +51,19 @@ from .kinematics import (
     official_urdf_path,
     urdf_facts,
 )
+from .poses import (
+    DEMO_TRAJECTORY_POSES,
+    KINEMATIC_ZERO,
+    RECOMMENDED_POSE_MARGIN,
+    SAFE_HOME,
+    SIM_INITIAL_POSE,
+    describe_pose,
+    is_commandable,
+    min_soft_margin,
+    pose_problems,
+    static_hold_within_torque_limits,
+    validate_trajectory_poses,
+)
 from .robot import R1Robot, R1Status
 from .safety import (
     SafetyConfig,
@@ -66,6 +79,8 @@ from .trajectory import (
     JointTrajectory,
     Outcome,
     TrajectoryExecutor,
+    TrajectoryLimits,
+    required_segment_duration,
     waypoints_from_positions,
 )
 from .types import (
@@ -143,4 +158,18 @@ __all__ = [
     "ExecutionResult",
     "Outcome",
     "waypoints_from_positions",
+    "TrajectoryLimits",
+    "required_segment_duration",
+    # poses (kinematic zero / sim initial / safe home)
+    "KINEMATIC_ZERO",
+    "SIM_INITIAL_POSE",
+    "SAFE_HOME",
+    "DEMO_TRAJECTORY_POSES",
+    "RECOMMENDED_POSE_MARGIN",
+    "pose_problems",
+    "is_commandable",
+    "validate_trajectory_poses",
+    "min_soft_margin",
+    "describe_pose",
+    "static_hold_within_torque_limits",
 ]

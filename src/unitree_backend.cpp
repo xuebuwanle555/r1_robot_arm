@@ -10,8 +10,6 @@
 #include <sstream>
 #include <utility>
 
-#include "arm_motor_bus.h"
-
 #include "r1_robot/limits.hpp"
 #include "r1_robot/types.hpp"
 
@@ -92,18 +90,11 @@ bool calibrationFileUsable(const std::string& path, std::string* detail) {
   return true;
 }
 
-ControlMode modeFromMotor(std::uint8_t motor_mode) {
-  return (motor_mode == 1) ? ControlMode::kFoc : ControlMode::kStop;
 }
-
-std::uint8_t motorFromMode(ControlMode mode) {
-  return (mode == ControlMode::kFoc) ? 1u : 0u;
-}
-
-}  // namespace
 
 struct UnitreeArmBackend::Impl {
-  ArmMotorBus bus;
+  /// Transport.  Defaults to the real SDK bus; injectable for offline tests.
+  JointBusPtr bus;
   bool opened = false;
 };
 
@@ -127,14 +118,25 @@ bool UnitreeArmBackend::connect(std::string* error) {
   // Fail-closed: a freshly connected backend is never armed for motion.
   gate_.disarm();
 
+  if (!impl_->bus) {
+    impl_->bus = cfg_.bus_factory ? cfg_.bus_factory() : makeSdkJointBus();
+  }
+  if (!impl_->bus) {
+    return fail("refused: this build has no SDK joint bus (configure with "
+                "-DR1_ROBOT_WITH_UNITREE_BACKEND=ON)");
+  }
+
   std::string detail;
   if (!calibrationFileUsable(cfg_.calib_path, &detail)) {
     return fail("refused: unusable joint calibration (" + detail + ")");
   }
 
-  if (!impl_->bus.open(cfg_.port, cfg_.baudrate, cfg_.calib_path)) {
-    return fail("failed to open serial port '" + cfg_.port + "' at " +
-                std::to_string(cfg_.baudrate) + " baud");
+  std::string bus_error;
+  if (!impl_->bus->open(cfg_.port, cfg_.baudrate, cfg_.calib_path, &bus_error)) {
+    return fail(bus_error.empty()
+                    ? ("failed to open serial port '" + cfg_.port + "' at " +
+                       std::to_string(cfg_.baudrate) + " baud")
+                    : bus_error);
   }
 
   impl_->opened = true;
@@ -142,13 +144,13 @@ bool UnitreeArmBackend::connect(std::string* error) {
 }
 
 void UnitreeArmBackend::disconnect() {
-  if (!impl_ || !impl_->opened) {
+  if (!impl_ || !impl_->opened || !impl_->bus) {
     return;
   }
   // Mode 0 on every joint, then close.  NOT a brake.
   gate_.disarm();
-  impl_->bus.stop();
-  impl_->bus.close();
+  impl_->bus->stop();
+  impl_->bus->close();
   impl_->opened = false;
 }
 
@@ -167,39 +169,60 @@ RobotLimits UnitreeArmBackend::limits() const {
 
 RobotState UnitreeArmBackend::readState() const {
   RobotState out;
-  if (!impl_ || !impl_->opened) {
+  // A dropped port is not a usable state: report "not connected" so that every
+  // actuating command is refused, even if nobody called disconnect() yet.
+  if (!impl_ || !impl_->opened || !impl_->bus || !impl_->bus->isOpen()) {
     out.connected = false;
     return out;
   }
 
   out.connected = true;
-  const std::array<ArmJointState, kArmJointCount> states = impl_->bus.states();
-  const std::array<bool, kArmJointCount> ready = impl_->bus.feedbackReady();
+  const std::array<JointBusFeedback, kNumJoints> fb = impl_->bus->feedback();
+  const std::array<JointBusFeedbackStats, kNumJoints> stats =
+      impl_->bus->feedbackStats();
+  const std::uint64_t now = nowNs();
 
+  std::uint64_t oldest = 0;
+  bool any = false;
   for (int i = 0; i < kNumJoints; ++i) {
     const std::size_t si = static_cast<std::size_t>(i);
-    out.q[si] = states[si].q;
-    out.dq[si] = states[si].dq;
-    out.tau[si] = states[si].tau_est;
-    out.mode[si] = modeFromMotor(states[si].mode);
-    out.error_code[si] = states[si].error_code;
-    out.valid[si] = ready[si];
-    // NOT AVAILABLE: ArmJointState carries neither voltage nor temperature.
-    // Keep them at 0 ("unknown"); SafetyMonitor skips a 0 V reading instead of
-    // guessing.  TODO(bringup): extend the backend if the bus exposes them.
+    out.q[si] = fb[si].q;
+    out.dq[si] = fb[si].dq;
+    out.tau[si] = fb[si].tau_est;
+    out.mode[si] = fb[si].mode;
+    out.error_code[si] = fb[si].error_code;
+    // `valid` reflects "a CRC-valid frame has been received", which is all the
+    // bus can prove.  Freshness is carried separately by the timestamps below.
+    out.valid[si] = stats[si].received;
+    // NOT AVAILABLE: the SDK's ArmJointState carries neither voltage nor
+    // temperature.  Keep them at 0 ("unknown"); SafetyMonitor skips a 0 V
+    // reading instead of guessing.  TODO(bringup): extend if the bus exposes it.
     out.voltage[si] = 0.0;
     out.temperature_c[si] = 0.0;
+
+    // Reception time of the newest valid frame, derived from the bus-reported
+    // age.  NEVER the time of this call.
+    std::uint64_t stamp = 0;
+    if (stats[si].received && now > stats[si].age_ns) {
+      stamp = now - stats[si].age_ns;
+    }
+    out.joint_stamp_ns[si] = stamp;
+    if (stats[si].received) {
+      if (!any || stamp < oldest) {
+        oldest = stamp;
+        any = true;
+      }
+    }
   }
 
-  // The SDK does not expose a per-frame reception timestamp, so the state is
-  // stamped at read time.  TODO(bringup): verify that this is representative of
-  // the real feedback age at the configured control rate.
-  out.stamp_ns = nowNs();
+  // The global stamp is the age of the STALEST joint, so the existing global
+  // freshness check catches a single silent joint as well.
+  out.stamp_ns = any ? oldest : 0;
   return out;
 }
 
 bool UnitreeArmBackend::writeCommand(const ArmCommand& cmd) {
-  if (!impl_ || !impl_->opened) {
+  if (!impl_ || !impl_->opened || !impl_->bus) {
     return false;
   }
 
@@ -210,32 +233,32 @@ bool UnitreeArmBackend::writeCommand(const ArmCommand& cmd) {
     return false;
   }
 
-  std::array<ArmJointCmd, kArmJointCount> translated{};
+  std::array<JointBusCommand, kNumJoints> translated{};
   for (int i = 0; i < kNumJoints; ++i) {
     const std::size_t si = static_cast<std::size_t>(i);
     const JointCommand& src = cmd.joints[si];
-    ArmJointCmd& dst = translated[si];
-    dst.mode = motorFromMode(src.mode);
-    dst.q = static_cast<float>(src.q);   // URDF frame: converted inside the SDK
-    dst.dq = static_cast<float>(src.dq);
-    dst.tau = static_cast<float>(src.tau);
-    dst.kp = static_cast<float>(src.kp);
-    dst.kd = static_cast<float>(src.kd);
+    JointBusCommand& dst = translated[si];
+    dst.mode = src.mode;
+    dst.q = src.q;    // URDF frame: converted inside the SDK
+    dst.dq = src.dq;
+    dst.tau = src.tau;
+    dst.kp = src.kp;
+    dst.kd = src.kd;
     dst.timed_out = cmd.timed_out;
   }
 
-  impl_->bus.step(translated);
+  impl_->bus->step(translated);
   return true;
 }
 
 void UnitreeArmBackend::stop() {
-  if (impl_ && impl_->opened) {
-    impl_->bus.stop();
+  if (impl_ && impl_->opened && impl_->bus) {
+    impl_->bus->stop();
   }
 }
 
 bool UnitreeArmBackend::probeFeedback(std::string* error) {
-  if (!impl_ || !impl_->opened) {
+  if (!impl_ || !impl_->opened || !impl_->bus) {
     if (error) {
       *error = "refused: not connected";
     }
@@ -244,18 +267,18 @@ bool UnitreeArmBackend::probeFeedback(std::string* error) {
 
   // Mode 1 (FOC) with zero gains and zero torque on every joint.
   // THIS POWERS THE BRIDGES - the arm will be limp.
-  std::array<ArmJointCmd, kArmJointCount> zero{};
+  std::array<JointBusCommand, kNumJoints> zero{};
   for (int i = 0; i < kNumJoints; ++i) {
-    ArmJointCmd& c = zero[static_cast<std::size_t>(i)];
-    c.mode = 1;
+    JointBusCommand& c = zero[static_cast<std::size_t>(i)];
+    c.mode = ControlMode::kFoc;
     c.timed_out = false;
-    c.q = 0.f;
-    c.dq = 0.f;
-    c.tau = 0.f;
-    c.kp = 0.f;
-    c.kd = 0.f;
+    c.q = 0.0;
+    c.dq = 0.0;
+    c.tau = 0.0;
+    c.kp = 0.0;
+    c.kd = 0.0;
   }
-  impl_->bus.step(zero);
+  impl_->bus->step(zero);
   return true;
 }
 

@@ -131,6 +131,27 @@ SafetyReport SafetyMonitor::checkState(const RobotState& state,
     }
   }
 
+  // Per-joint freshness.  Only checked when the backend actually publishes
+  // per-joint reception timestamps (`joint_stamp_ns[i] != 0`); a backend that
+  // does not is covered by the global check above and must not be double
+  // reported.  A named joint is far more actionable than "something is stale".
+  for (int i = 0; i < kNumJoints; ++i) {
+    const std::size_t si = static_cast<std::size_t>(i);
+    const std::uint64_t own = state.joint_stamp_ns[si];
+    if (own == 0 || own > now) {
+      continue;  // unknown / future -> handled above
+    }
+    const double age_s = static_cast<double>(now - own) * 1e-9;
+    if (age_s > cfg_.max_feedback_age_s) {
+      std::ostringstream oss;
+      oss << std::setprecision(3) << "joint " << i << " feedback age " << age_s
+          << " s exceeds max_feedback_age_s=" << cfg_.max_feedback_age_s
+          << " (this joint has stopped reporting)";
+      report.issues.push_back(makeIssue(
+          SafetyLevel::kFault, "state.joint_stale_feedback", oss.str()));
+    }
+  }
+
   if (!state.allFinite()) {
     report.issues.push_back(makeIssue(
         SafetyLevel::kFault, "state.non_finite",

@@ -175,7 +175,82 @@ function(r1_sdk_add_cleanliness_check target)
   add_dependencies(${_r1_check_target} ${target})
 endfunction()
 
-# ===========================================================================
+# ---------------------------------------------------------------------------
+# Helper: build the SDK from a PATCHED COPY, never from the submodule itself.
+#
+# WHY
+#   Upstream ArmMotorBus exposes only a sticky feedbackReady() flag and no
+#   reception timestamp, so stale feedback cannot be detected: a bus that died
+#   after the first frame looks identical to a healthy one.  A minimal,
+#   documented patch (patches/0001-arm_motor_bus-feedback-stats.patch) adds
+#   per-joint reception time + packet count.
+#
+#   The read-only guarantee is preserved: the submodule is never modified.
+#   The two touched files are copied into <build>/sdk_patched and the patch is
+#   applied there, so the difference against the official pin is exactly the
+#   patch file, which is versioned with r1_robot.
+#
+# PROVIDES
+#   R1_SDK_PATCHED_DIR   build-tree copy to compile instead of the submodule
+# ---------------------------------------------------------------------------
+function(r1_sdk_prepare_patched_sources)
+  set(_patch
+      "${R1_SDK_MODULE_DIR}/../patches/0001-arm_motor_bus-feedback-stats.patch")
+  if(NOT EXISTS "${_patch}")
+    message(FATAL_ERROR
+      "r1_robot: the SDK patch is missing: ${_patch}\n"
+      "          It is required to obtain real feedback reception timestamps.")
+  endif()
+
+  find_program(R1_PATCH_EXECUTABLE patch)
+  if(NOT R1_PATCH_EXECUTABLE)
+    message(FATAL_ERROR
+      "r1_robot: 'patch' is required to build the patched SDK copy "
+      "(install it, or use -DR1_ROBOT_WITH_UNITREE_BACKEND=OFF for a mock-only "
+      "build).")
+  endif()
+
+  set(_dir "${CMAKE_BINARY_DIR}/sdk_patched")
+  # Refresh the copies every configure so the patch always applies to pristine
+  # sources (idempotent across re-configures).
+  file(COPY "${R1_SDK_ROOT}/include/arm_motor_bus.h" DESTINATION "${_dir}/include")
+  file(COPY "${R1_SDK_ROOT}/src/arm_motor_bus.cpp" DESTINATION "${_dir}/src")
+
+  execute_process(
+    COMMAND "${R1_PATCH_EXECUTABLE}" -p1 --batch --forward --silent
+            -i "${_patch}"
+    WORKING_DIRECTORY "${_dir}"
+    RESULT_VARIABLE _rc
+    OUTPUT_VARIABLE _out
+    ERROR_VARIABLE _err)
+  if(NOT _rc EQUAL 0)
+    message(FATAL_ERROR
+      "r1_robot: could not apply the minimal SDK patch to the build-tree copy.\n"
+      "  patch  : ${_patch}\n"
+      "  target : ${_dir}\n"
+      "  output : ${_out}${_err}\n"
+      "The SDK pin most likely changed.  Re-derive the patch against the new "
+      "pin; do NOT patch the submodule in place.")
+  endif()
+
+  # Verify the API the backend relies on really exists after patching.
+  file(READ "${_dir}/include/arm_motor_bus.h" _patched_header)
+  string(FIND "${_patched_header}" "feedbackStats()" _missing)
+  if(_missing EQUAL -1)
+    message(FATAL_ERROR
+      "r1_robot: the patch reported success but feedbackStats() is missing "
+      "from ${_dir}/include/arm_motor_bus.h")
+  endif()
+
+  file(SHA256 "${_patch}" _sha)
+  message(STATUS "  patch     : 0001-arm_motor_bus-feedback-stats.patch")
+  message(STATUS "              sha256 ${_sha}")
+  message(STATUS "              applied to a build-tree copy (submodule untouched)")
+
+  set(R1_SDK_PATCHED_DIR "${_dir}" PARENT_SCOPE)
+endfunction()
+
+# ---------------------------------------------------------------------------
 # Resolve the dependency
 # ===========================================================================
 if(NOT R1_ROBOT_WITH_UNITREE_BACKEND)

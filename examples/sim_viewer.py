@@ -55,14 +55,10 @@ sys.path.insert(0, str(REPO_ROOT / "python"))
 
 import r1_robot as rr  # noqa: E402
 
-# Safe poses: every joint inside [lower + 0.05, upper - 0.05].
-HOME = np.array([0.0, 0.30, 0.30, 0.30, 0.0, 0.0, 0.0])
-WAYPOINTS = [
-    HOME,
-    np.array([0.30, 0.60, 0.20, 0.50, -0.30, 0.20, 0.30]),
-    np.array([-0.30, 0.40, 0.50, 0.20, 0.30, -0.20, -0.30]),
-    HOME,
-]
+# Safe poses come from the package so a single test asserts that every demo
+# waypoint respects the soft limits (see r1_robot/poses.py).
+HOME = rr.SAFE_HOME
+WAYPOINTS = list(rr.DEMO_TRAJECTORY_POSES)
 
 
 def check_waypoints(waypoints) -> None:

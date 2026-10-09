@@ -57,6 +57,7 @@ endfunction()
 add_library(r1_robot_core STATIC
   src/config.cpp
   src/gripper.cpp
+  src/joint_bus.cpp
   src/limits.cpp
   src/mock_arm.cpp
   src/r1_arm.cpp
@@ -94,15 +95,23 @@ if(R1_ROBOT_WITH_UNITREE_BACKEND AND R1_SDK_FOUND)
   # Fails the build if the checkout ends up dirty anyway.
   r1_sdk_add_cleanliness_check(motor_controller)
 
+  # The SDK is compiled from a build-tree copy with the minimal, documented
+  # feedback-stats patch applied; the submodule itself stays read-only.
+  r1_sdk_prepare_patched_sources()
+
   add_library(r1_robot_unitree_backend STATIC
     src/backend_factory.cpp
+    src/sdk_joint_bus.cpp
     src/unitree_backend.cpp
-    "${R1_SDK_ROOT}/src/arm_motor_bus.cpp"
+    "${R1_SDK_PATCHED_DIR}/src/arm_motor_bus.cpp"
   )
   add_library(r1_robot::unitree ALIAS r1_robot_unitree_backend)
 
+  # The PATCHED copy must come first so `#include "arm_motor_bus.h"` picks up
+  # the version that provides feedbackStats().
   target_include_directories(r1_robot_unitree_backend
     PUBLIC  "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    PRIVATE "${R1_SDK_PATCHED_DIR}/include"
     PRIVATE "${R1_SDK_ROOT}/include")
 
   target_link_libraries(r1_robot_unitree_backend

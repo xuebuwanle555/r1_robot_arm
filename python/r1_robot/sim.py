@@ -288,7 +288,10 @@ class SimArm(ArmBackend):
         self.model.opt.timestep = float(self.config.timestep)
         self.model.opt.gravity[:] = np.asarray(self.config.gravity, dtype=np.float64)
 
-        if not self.config.enable_collision:
+        if self.config.enable_collision:
+            self.model.geom_contype[:] = 1
+            self.model.geom_conaffinity[:] = 1
+        else:
             self.model.geom_contype[:] = 0
             self.model.geom_conaffinity[:] = 0
 

@@ -188,12 +188,38 @@ untouched.
 | Commit subject | `2026-09-28:add step file` |
 | SDK `VERSION` | `Version: 0.1.0` |
 | Diff vs the ZIP | **none** — `diff -rq` (excluding `.git`/`.vscode`) is empty, i.e. the ZIP already corresponded to the pinned commit |
+| Build-time patch | `patches/0001-arm_motor_bus-feedback-stats.patch` (sha256 printed at configure time). Applied to a **build-tree copy** only — the submodule is never modified |
 
 Core sources (`src/arm_motor_bus.cpp`, `include/arm_motor_bus.h`), the
 third-party motor driver (`thirdparty/motor_controller/**`) and the URDF/mesh
 assets all match the ZIP exactly, so the submodule introduces no interface
 change. The build resolves the submodule by default, reports the commit at
 configure time and at runtime, and never falls back to the ZIP path.
+
+The single build-time patch exists because upstream exposes no feedback
+reception time or counter (only a sticky `ready` flag), which makes stale
+feedback undetectable. It adds `ArmMotorBus::feedbackStats()`; the copied files
+are patched in `<build>/sdk_patched` and the official checkout stays clean
+(enforced by `r1_sdk_cleanliness_check`). See `SAFETY_REVIEW.md` §3b.
+
+### Documentation map
+
+| File | Contents |
+|---|---|
+| `SIMULATION.md` | Pinocchio kinematics, MuJoCo model, `SimArm`, trajectories, viewer |
+| `SAFETY_REVIEW.md` | Independent safety review, fixes, `HARDWARE_UNVERIFIED` risks, and §9 on the Python/C++ control boundary |
+| `JOINT_MAPPING.md` | Joint map (URDF ↔ SDK index ↔ motor id ↔ gear ratio ↔ calibration), the three reference poses, unit chain and source contradictions |
+| `HARDWARE_BRINGUP.md` | Staged real-arm bring-up procedure (manual, explicit) |
+
+### Test summary
+
+| Suite | Count | Command |
+|---|---|---|
+| C++ | 85 | `ctest --test-dir build --output-on-failure` |
+| Python | 97 | `cd python && python -m pytest -q` |
+
+Python simulation/dynamics tests skip automatically when MuJoCo or Pinocchio is
+not installed.
 
 ### Simulation (MuJoCo + Pinocchio)
 

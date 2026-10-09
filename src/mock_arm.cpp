@@ -98,6 +98,9 @@ RobotState MockArm::readState() const {
     s.mode[si] = last_cmd_.joints[si].mode;
     s.error_code[si] = error_code_[si];
     s.valid[si] = connected_ && fb_valid_[si];
+    // The mock "receives" a frame at `s.stamp_ns` for every joint it reports
+    // as valid; an invalid joint has no reception evidence at all.
+    s.joint_stamp_ns[si] = s.valid[si] ? s.stamp_ns : 0;
   }
   return s;
 }

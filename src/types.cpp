@@ -148,6 +148,14 @@ double RobotState::minSupplyVoltage() const {
   return first ? 0.0 : min_v;
 }
 
+std::uint64_t RobotState::jointStampNs(int joint) const {
+  if (joint < 0 || joint >= kNumJoints) {
+    return 0;
+  }
+  const std::uint64_t s = joint_stamp_ns[static_cast<std::size_t>(joint)];
+  return (s != 0) ? s : stamp_ns;
+}
+
 std::uint64_t nowNs() {
   // time_since_epoch keeps the value large and monotonically increasing from
   // process start, so timestamp arithmetic (staleness, "in the future") never
