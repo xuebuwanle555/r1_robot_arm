@@ -1,0 +1,21 @@
+build/
+build-*/
+_deps/
+*.o
+*.a
+*.so
+*.so.*
+.cache/
+compile_commands.json
+.vscode/ipch/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+logs/
+*.bag
+*.mc
+# Local, machine-specific calibration must never be committed blindly.
+config/joint_calib.txt

@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "r1-robot"
+version = "0.1.0"
+description = "Python API for the Unitree R1-7A research stack (phase 1: offline mock only)"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = ["numpy>=1.23"]
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0"]
+# Simulation / kinematics extras: MuJoCo physics and Pinocchio kinematics.
+sim = ["mujoco>=3.0", "pin>=2.6", "numpy>=1.23"]
+
+[tool.setuptools]
+packages = ["r1_robot"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

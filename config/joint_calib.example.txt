@@ -1,0 +1,31 @@
+# joint_calib — URDF joint frame <-> motor frame
+#
+#   urdf_angle = dir * scale * motor_angle + offset
+#   motor_angle = (urdf_angle - offset) / (dir * scale)
+#
+# Format: one line per joint, 7 joints required (index 0..6):
+#
+#   joint  dir  scale  offset
+#
+#   joint   joint index, 0..6 (matches motor id by default)
+#   dir     +1 or -1, the rotation direction
+#   scale   > 0, maps the motor span onto the URDF span
+#   offset  rad, the URDF value when motor_angle = 0
+#
+# !! THESE ARE THE VALUES SHIPPED WITH THE OFFICIAL SDK EXAMPLE !!
+# They are NOT a calibration for your arm. Produce the real file on the arm
+# with the official tool, from the SDK's bin/ directory, with the arm held at
+# the desired URDF zero pose:
+#
+#   ./calibrate_joints --port /dev/ttyUSB3 --out ../config/joint_calib.txt
+#
+# See HARDWARE_BRINGUP.md stage 1.
+#
+# joint dir    scale     offset
+0  -1.00000000 1.00000000 -2.721
+1   1.00000000 1.00000000 -0.05
+2   1.00000000 1.00000000 -0.35011
+3  -1.00000000 1.00000000 -0.025
+4  -1.00000000 1.00000000 -2.27451
+5   1.00000000 1.00000000 -0.52377
+6  -1.00000000 1.00000000 -1.57638
