@@ -222,8 +222,10 @@ numerical validation, MuJoCo model generation + cross-validation, `SimArm`,
 minimum-jerk trajectories with a real success predicate (position + velocity +
 sustained dwell), headless viewer, **authored collision modes** (`none` /
 `environment` / `self`) with a validated tabletop + self-collision scenario,
-actuator-saturation and joint-limit checks, and a **dynamics-parameter
-provenance** map (`dynamics_provenance()`).
+actuator-saturation and joint-limit checks, a **dynamics-parameter
+provenance** map (`dynamics_provenance()`), and an **opt-in pybind11 bridge**
+that runs the production C++ `ControlService` against the real `SimArm` plant
+(`python/binding/`, `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON`).
 
 Not done (deliberately): no ROS2 / MoveIt2 / LeRobot, no VLA, no real-arm
 motion, no contact-rich *manipulation* policy, no model-based controller beyond
@@ -242,4 +244,7 @@ visual STL, so self-collision is conservative (see `SAFETY_REVIEW.md` open risk
 4. **Trajectory polish**: time-scaling to satisfy `max_velocity`/`max_accel`
    from the URDF, and Cartesian waypoints interpolated in task space.
 5. **Hardware parity**: replay recorded SimArm poses through the C++ stack and
-   compare against `MockArm` for regression coverage.
+   compare against `MockArm` for regression coverage. *(Partly done: the opt-in
+   bridge now runs the production C++ `ControlService` against the real `SimArm`
+   plant and exercises the watchdog against the real monotonic clock — see
+   `python/tests/test_control_binding.py`.)*

@@ -68,6 +68,7 @@ r1_robot/
 ├── python/
 │   ├── pyproject.toml
 │   ├── r1_robot/                  Python API (types, limits, safety, backends, robot, gripper, config)
+│   ├── binding/                   OPTIONAL pybind11 C++↔sim bridge (off by default)
 │   └── tests/                     33 offline unit tests
 ├── config/
 │   ├── r1_robot.conf              safety thresholds + backend selection
@@ -223,11 +224,14 @@ are patched in `<build>/sdk_patched` and the official checkout stays clean
 | Suite | Count | Command |
 |---|---|---|
 | C++ | 103 unit cases / 11 ctest suites (SDK build); 94 / 11 without the SDK | `ctest --test-dir build --output-on-failure` |
-| Python | 103 | `cd python && python -m pytest -q` |
+| Python | 103 (2 more skip unless the bridge is built) | `cd python && python -m pytest -q` |
+| C++↔sim bridge (opt-in) | +2 (105 total) | build with `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON` |
 
 Python simulation/dynamics tests skip automatically when MuJoCo or Pinocchio is
 not installed. The C++ suite is validated in CI both with the pinned SDK and with
-`-DR1_ROBOT_WITH_UNITREE_BACKEND=OFF` (mock only, warnings-as-errors).
+`-DR1_ROBOT_WITH_UNITREE_BACKEND=OFF` (mock only, warnings-as-errors). The
+pybind11 bridge tests skip in CI because the binding is off by default; they run
+only when it is built explicitly (see §4).
 
 ### Simulation (MuJoCo + Pinocchio)
 
@@ -323,6 +327,15 @@ cd python && python -m pytest -q                      # 103 passed
 ./build/tests/r1_robot_tests --filter control_service  # comm-loss -> fault latch -> refuse motion
 ./build/tests/r1_robot_tests --filter motion_gate      # bypass attempts are refused
 cd python && python -m pytest tests/test_dynamics.py -k collision  # MuJoCo detects a designed collision
+
+# 5. (Optional) C++↔sim bridge: hand the PRODUCTION C++ ControlService the real
+#    MuJoCo plant and watch it drive physics, then latch a fault on comm loss
+#    against the real monotonic clock. Off by default, so it never affects the
+#    build above. Requires MuJoCo + Pinocchio + pybind11.
+pip install pybind11 mujoco pinocchio
+cmake -S . -B build-bridge -DR1_ROBOT_BUILD_PYTHON_BINDING=ON
+cmake --build build-bridge
+cd python && python -m pytest tests/test_control_binding.py -q   # 2 passed
 ```
 
 The same three configurations run in CI (`.github/workflows/ci.yml`), including a
@@ -347,9 +360,13 @@ negative test that a stray file written into the SDK checkout fails the build.
   heartbeats to it; they never touch the backend. Arming either entry point needs
   the unforgeable `MotionControl` token.
 * **Python does not own the real-time loop.** It is for planning, datasets,
-  policy inference and analysis. The single documented bridge is a pybind11
-  module or a ROS2/ZMQ service in front of the C++ `R1Arm` (phase 3), keeping
-  the safety gates on the C++ side.
+  policy inference and analysis. An **opt-in** pybind11 bridge
+  (`-DR1_ROBOT_BUILD_PYTHON_BINDING=ON`) lets Python hand joint targets to the
+  production C++ `ControlService`, which owns the loop, the watchdog and the
+  fault latch; the module is off by default so the core build never depends on
+  it. On real hardware the same `ControlService` would be reached over a
+  ROS2/ZMQ link that cannot command motors directly (phase 3). The safety gates
+  always stay on the C++ side.
 * **The gripper is a separate CAN device.** It is intentionally *not* wired into
   the arm's serial bus abstraction.
 
@@ -377,6 +394,7 @@ See `HARDWARE_BRINGUP.md` §7 for the full checklist. Summary:
 | `ControlService` watchdog latches on upper-layer silence and never auto-re-arms | `control_service_watchdog_latches_on_silence_then_refuses_motion` (+ stale-feedback / motor-error / port-drop variants) |
 | Feedback values + reception evidence come from one atomic snapshot | `snapshot_atomic_all_joints_share_one_clock`, `snapshot_*` suite |
 | MuJoCo detects a designed collision scenario | `test_environment_mode_detects_a_designed_tabletop_collision`, `test_self_mode_nominal_is_clean_but_a_fold_is_detected` |
+| Opt-in pybind11 bridge: the production C++ `ControlService` drives the real MuJoCo plant and latches a fault on comm loss against the real monotonic clock | `python/tests/test_control_binding.py` (`test_cpp_service_drives_mujoco_then_survives_comm_loss`, requires `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON`) |
 | 103 C++ + 103 Python tests pass (SDK build; 94 C++ without the SDK) | `ctest` / `pytest` |
 
 ### To be verified on real hardware (`TODO(bringup)` / 待验证)
@@ -407,9 +425,9 @@ See `HARDWARE_BRINGUP.md` §7 for the full checklist. Summary:
 | Phase | Content |
 |---|---|
 | **1 (done)** | Architecture, `R1Arm`, safety framework, `MockArm`, gripper interface, C++ + Python APIs, tests, docs |
-| **1.5 (done, this branch)** | P0 hardware control-permission boundary (unforgeable `MotionControl`), standalone C++ `ControlService` (periodic loop, watchdog, fault latch), atomic feedback snapshot (`feedbackSnapshot()` patch v2), real trajectory success predicate, working MuJoCo collision detection, CI + license |
+| **1.5 (done, this branch)** | P0 hardware control-permission boundary (unforgeable `MotionControl`), standalone C++ `ControlService` (periodic loop, watchdog, fault latch), atomic feedback snapshot (`feedbackSnapshot()` patch v2), real trajectory success predicate, working MuJoCo collision detection, CI + license, **opt-in C++↔MuJoCo pybind11 bridge** |
 | 2 | Hardware bring-up; gravity compensation; joint-space trajectories with feed-forward on the real arm |
-| 3 | Real-time bridge (pybind11 or ROS2/ZMQ) so Python can command the C++ `R1Arm` without owning the loop |
+| 3 | Harden the bridge for real hardware (ROS2/ZMQ transport in front of `ControlService`) so Python commands the arm without owning the loop |
 | 4 | ROS2 + MoveIt2, URDF/mesh integration, camera drivers (D435, Astra Pro) |
 | 5 | LeRobot datasets, ACT, Diffusion Policy, π₀/π₀.₅ evaluation |
 

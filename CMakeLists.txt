@@ -27,6 +27,8 @@ find_package(Threads REQUIRED)
 option(R1_ROBOT_BUILD_TESTS "Build the unit tests" ON)
 option(R1_ROBOT_WITH_UNITREE_BACKEND
   "Build the real-hardware backend that links the official R1 SDK" ON)
+option(R1_ROBOT_BUILD_PYTHON_BINDING
+  "Build the optional pybind11 module that lets the C++ ControlService drive the Python MuJoCo SimArm. OFF by default: the core and CI builds never require Python/pybind11/MuJoCo." OFF)
 option(R1_ROBOT_WARNINGS_AS_ERRORS "Treat compiler warnings as errors" OFF)
 
 set(R1_ROBOT_SDK_ROOT "" CACHE PATH
@@ -147,6 +149,14 @@ endif()
 if(R1_ROBOT_BUILD_TESTS)
   enable_testing()
   add_subdirectory(tests)
+endif()
+
+# ---------------------------------------------------------------------------
+# Optional pybind11 bridge (C++ ControlService -> Python MuJoCo SimArm).
+# Off by default; enabling it requires Python dev headers + `pip install pybind11`.
+# ---------------------------------------------------------------------------
+if(R1_ROBOT_BUILD_PYTHON_BINDING)
+  add_subdirectory(python/binding)
 endif()
 
 # ---------------------------------------------------------------------------

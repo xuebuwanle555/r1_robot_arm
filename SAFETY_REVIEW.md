@@ -261,7 +261,10 @@ and trajectories; it does not own the hardware control loop or its timing.
   `MockArm` (simulation) and `SimArm` (MuJoCo, `is_real_hardware == False`), plus
   `NullBackend`, whose `is_real_hardware` is `True` but whose every method
   raises. There is no Python serial/SDK path at all. Guarded by
-  `tests/test_trajectory.py::TestNoPythonHardwarePath`.
+  `tests/test_trajectory.py::TestNoPythonHardwarePath`. The opt-in pybind11
+  bridge below reaches hardware *semantics* only through the C++
+  `ControlService`/`IArmBackend` gates — and it is wired to `SimArm`, never to
+  the real backend, so this property is unchanged.
 * **`TrajectoryExecutor` never talks to a backend directly.** It takes an
   `R1Robot` and sends every frame through `R1Robot.send_action()`, so the soft
   limits, gain/torque envelope, anti-step rule, freshness and motor-error checks
@@ -278,12 +281,20 @@ and trajectories; it does not own the hardware control loop or its timing.
   `false`; `enableMotion(human_confirmed=true)` is required; the backend gate is
   armed only there. Nothing in Python can bypass this — see §1a and §8.
 
-**Required for real hardware (not implemented here).** A real device must be
+**Required for real hardware (partly demonstrated here).** A real device must be
 driven by a **dedicated C++ control service** that owns the real-time loop, the
 watchdog policy and the fault arbitration; Python becomes a client that submits
-targets and trajectories over a link that cannot command motors directly. Phase
-1/2 deliberately stops at "the C++ library can do this correctly"; the service
-is phase-3 work.
+targets and trajectories over a link that cannot command motors directly. This
+branch adds an **opt-in pybind11 bridge** (`-DR1_ROBOT_BUILD_PYTHON_BINDING=ON`,
+off by default) that runs exactly that C++ `ControlService` against the real
+MuJoCo `SimArm` plant: Python submits a trajectory and heartbeats, `run_cycle()`
+performs the C++ control cycle, and the command-timeout watchdog is exercised
+against the **real monotonic clock** (no virtual-clock stubbing of the safety
+path). `python/tests/test_control_binding.py` shows the full sequence — physics
+tracks the goal, upper-layer silence latches `comm.watchdog_timeout`, motion is
+refused until an operator clears and re-enables, then resumes. The bridge is a
+*simulation* validation only; a real transport (ROS2/ZMQ) in front of the same
+service is still phase-3 work.
 
 **Timing.** The MuJoCo timestep (2 ms / 500 Hz) is a *simulation* choice and says
 nothing about the real command rate. `ArmMotorBus::step()` sleeps 115 µs after

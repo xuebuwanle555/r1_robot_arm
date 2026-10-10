@@ -327,8 +327,13 @@ void ControlService::runCycle() {
   if (!backend_ || state_ == ServiceState::kUnconnected) {
     return;
   }
-  const std::uint64_t t = now();
-  latest_state_ = backend_->readState();
+  const std::uint64_t t = [&] {
+    // Refresh feedback FIRST, then take the reference time, so a backend that
+    // stamps its state with its own clock reading (taken moments before `t`)
+    // can never appear "in the future" relative to the safety check.
+    latest_state_ = backend_->readState();
+    return now();
+  }();
   ++ticks_;
 
   // 1) Controlled-stop / motor-disable sequencing.  Runs for a stop reached via
