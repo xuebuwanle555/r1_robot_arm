@@ -17,6 +17,7 @@
 #include <string>
 
 #include "r1_robot/limits.hpp"
+#include "r1_robot/motion_control.hpp"
 #include "r1_robot/types.hpp"
 
 namespace r1_robot {
@@ -60,13 +61,21 @@ class IArmBackend {
   /// arm that is loaded by gravity (documented in HARDWARE_BRINGUP.md).
   virtual void stop() = 0;
 
-  /// Arm/disarm the backend-level motion gate.  R1Arm is the only legitimate
-  /// caller: it arms in enableMotion() and disarms in
-  /// disableMotion()/stop()/emergencyStop()/disconnect().
+  /// Arm/disarm the backend-level motion gate.  This is the ONLY way to open the
+  /// hardware write path, and it requires an unforgeable MotionControl token:
+  /// ordinary business code cannot obtain one, so it cannot disarm the motion
+  /// lock for a real backend (see r1_robot/motion_control.hpp).
+  ///
+  /// R1Arm and ControlService are the only classes that can mint a token, and
+  /// they do so strictly after every precondition (allow_real_hardware, human
+  /// confirmation, calibration, healthy state) holds.
   ///
   /// Default implementation is a no-op; backends that do not drive hardware do
   /// not need a gate (see motionArmed()).
-  virtual void setMotionArmed(bool armed) { (void)armed; }
+  virtual void setMotionArmed(bool armed, const MotionControl& control) {
+    (void)armed;
+    (void)control;
+  }
 
   /// True when this backend will accept an *actuating* command.
   ///
@@ -74,6 +83,25 @@ class IArmBackend {
   /// motors is always "armed" so R1Arm needs no special casing, while a real
   /// backend that does not override this reports `false` (fail-closed).
   virtual bool motionArmed() const { return !isRealHardware(); }
+
+  /// Send ONE zero-torque FOC frame to every joint to wake up motor feedback.
+  ///
+  /// This POWERS THE MOTOR BRIDGES (mode 1) with zero gain: the arm becomes
+  /// compliant and will NOT hold its own weight.  It therefore changes the
+  /// motor mode and is an actuating entry point, not a read-only query, so it
+  /// requires the same unforgeable token as arming and never runs automatically.
+  /// An operator triggers it deliberately through
+  /// R1Arm::probeFeedbackForBringup() (see HARDWARE_BRINGUP.md).
+  ///
+  /// Default: refuse.  Only a real-hardware backend that can actually deliver
+  /// the frame overrides this.
+  virtual bool probeFeedback(std::string* error, const MotionControl& control) {
+    (void)control;
+    if (error) {
+      *error = "refused: this backend does not support a feedback probe";
+    }
+    return false;
+  }
 };
 
 using ArmBackendPtr = std::shared_ptr<IArmBackend>;

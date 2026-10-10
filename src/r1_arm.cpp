@@ -16,7 +16,7 @@ R1Arm::R1Arm(ArmBackendPtr backend, R1ArmConfig config)
   }
   // Fail-closed: a real backend is never armed before connect()/enableMotion().
   if (backend_) {
-    backend_->setMotionArmed(false);
+    backend_->setMotionArmed(false, control_);
   }
 }
 
@@ -25,7 +25,7 @@ R1Arm::~R1Arm() {
   // Fail-safe teardown: disarm and tell the backend to stop before closing.
   // NOTE: stop() removes motor output; it cannot hold the arm against gravity.
   if (backend_) {
-    backend_->setMotionArmed(false);
+    backend_->setMotionArmed(false, control_);
     if (status_.connected) {
       backend_->stop();
       backend_->disconnect();
@@ -61,7 +61,7 @@ bool R1Arm::connect(std::string* error) {
   }
 
   // A backend is always opened disarmed, whatever its previous state was.
-  backend_->setMotionArmed(false);
+  backend_->setMotionArmed(false, control_);
 
   std::string backend_error;
   if (!backend_->connect(&backend_error)) {
@@ -96,7 +96,7 @@ void R1Arm::disconnect() {
   motion_enabled_ = false;
   status_.motion_enabled = false;
   if (backend_) {
-    backend_->setMotionArmed(false);
+    backend_->setMotionArmed(false, control_);
     if (status_.connected) {
       backend_->stop();
       backend_->disconnect();
@@ -195,7 +195,7 @@ bool R1Arm::enableMotion(bool human_confirmed, std::string* error) {
   motion_enabled_ = true;
   status_.motion_enabled = true;
   // Defense in depth: arm the backend only now that every gate above passed.
-  backend_->setMotionArmed(true);
+  backend_->setMotionArmed(true, control_);
   return true;
 }
 
@@ -204,7 +204,7 @@ void R1Arm::disableMotion() {
   motion_enabled_ = false;
   status_.motion_enabled = false;
   if (backend_) {
-    backend_->setMotionArmed(false);
+    backend_->setMotionArmed(false, control_);
     if (status_.connected) {
       backend_->stop();
     }
@@ -287,12 +287,36 @@ void R1Arm::emergencyStop() {
   motion_enabled_ = false;
   status_.motion_enabled = false;
   if (backend_) {
-    backend_->setMotionArmed(false);
+    backend_->setMotionArmed(false, control_);
     if (status_.connected) {
       backend_->stop();
     }
   }
   refreshLocked();
+}
+
+bool R1Arm::probeFeedbackForBringup(bool human_confirmed, std::string* error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  auto fail = [error](const std::string& msg) {
+    if (error) {
+      *error = msg;
+    }
+    return false;
+  };
+
+  if (!human_confirmed) {
+    return fail(
+        "refused: the feedback probe powers the motor bridges (the arm goes "
+        "compliant) and requires human_confirmed = true");
+  }
+  if (!status_.connected) {
+    return fail("refused: not connected");
+  }
+  if (backend_->isRealHardware() && !config_.safety.allow_real_hardware) {
+    return fail(
+        "refused: probing a real backend requires allow_real_hardware = true");
+  }
+  return backend_->probeFeedback(error, control_);
 }
 
 bool R1Arm::home(std::string* error) {
@@ -316,9 +340,11 @@ SafetyConfig R1Arm::safetyConfig() const {
   return config_.safety;
 }
 
-ArmBackendPtr R1Arm::backend() const {
+std::shared_ptr<const IArmBackend> R1Arm::backend() const {
   std::lock_guard<std::mutex> lock(mutex_);
-  return backend_;
+  // Return a const view: only read-only methods (readState/limits/isConnected/
+  // motionArmed/...) are callable, so no caller can actuate or arm through it.
+  return std::static_pointer_cast<const IArmBackend>(backend_);
 }
 
 void R1Arm::setLimits(const RobotLimits& limits) {

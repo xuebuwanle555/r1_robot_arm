@@ -235,11 +235,13 @@ function(r1_sdk_prepare_patched_sources)
 
   # Verify the API the backend relies on really exists after patching.
   file(READ "${_dir}/include/arm_motor_bus.h" _patched_header)
-  string(FIND "${_patched_header}" "feedbackStats()" _missing)
+  string(FIND "${_patched_header}" "feedbackSnapshot()" _missing)
   if(_missing EQUAL -1)
     message(FATAL_ERROR
-      "r1_robot: the patch reported success but feedbackStats() is missing "
-      "from ${_dir}/include/arm_motor_bus.h")
+      "r1_robot: the patch reported success but feedbackSnapshot() is missing "
+      "from ${_dir}/include/arm_motor_bus.h.  The backend needs the atomic "
+      "value+reception-evidence snapshot (patch v2); a value must never be read "
+      "in a separate lock pass from its age.")
   endif()
 
   file(SHA256 "${_patch}" _sha)

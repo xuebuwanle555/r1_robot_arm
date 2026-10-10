@@ -94,6 +94,18 @@ class R1Arm {
   /// Immediate stop + disarm.  Bypasses every other gate by design.
   void emergencyStop();
 
+  /// Operator bring-up: send ONE zero-torque FOC frame to wake up feedback.
+  ///
+  /// This POWERS THE MOTOR BRIDGES - the arm goes compliant and will NOT hold
+  /// its own weight - so it is deliberately gated:
+  ///   * `human_confirmed` must be true, and
+  ///   * for a real backend, SafetyConfig::allow_real_hardware must be set.
+  ///
+  /// It does NOT arm the motion gate and is never called implicitly.  This is
+  /// the only path by which anything (including the bring-up tool) can make a
+  /// backend emit a non-stop motor frame outside sendAction().
+  bool probeFeedbackForBringup(bool human_confirmed, std::string* error);
+
   /// Blocked in phase 1 - returns false with an explanatory error.
   /// The official SDK examples home by *creeping* toward q = 0 with limited
   /// lead; that behaviour is intentionally not exposed until it has been
@@ -104,11 +116,12 @@ class R1Arm {
   /// Limits used for validation (by value: safe to read from any thread).
   RobotLimits limits() const;
   SafetyConfig safetyConfig() const;
-  /// The backend handle.  NOTE: forwarding a command straight to the backend
-  /// bypasses every gate in this class; a real-hardware backend therefore
-  /// refuses actuating commands until R1Arm::enableMotion() arms it (see
-  /// r1_robot/motion_gate.hpp).
-  ArmBackendPtr backend() const;
+  /// A READ-ONLY handle on the backend.  This deliberately hides every actuating
+  /// method (writeCommand/stop/setMotionArmed/probeFeedback are non-const and so
+  /// ill-formed through a `const` object), so upper layers can poll state but can
+  /// neither drive the motors nor disarm the motion lock behind R1Arm's back.
+  /// Commands must go through sendAction(), which re-validates each frame.
+  std::shared_ptr<const IArmBackend> backend() const;
 
   void setLimits(const RobotLimits& limits);
 
@@ -125,6 +138,9 @@ class R1Arm {
   RobotState state_{};
   R1ArmStatus status_{};
   bool motion_enabled_ = false;
+  // R1Arm is a friend of MotionControl, so it can mint the token that arms the
+  // backend gate.  No other class can obtain one.
+  MotionControl control_{};
 };
 
 }  // namespace r1_robot

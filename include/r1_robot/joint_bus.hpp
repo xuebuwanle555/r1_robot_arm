@@ -63,6 +63,23 @@ struct JointBusFeedbackStats {
   std::uint64_t packets = 0;
   /// Age of the newest valid frame [ns].  0 when `received == false`.
   std::uint64_t age_ns = 0;
+  /// The single monotonic instant [ns] that `age_ns` was measured against.  The
+  /// reader subtracts `age_ns` from THIS value (not from the time of its own
+  /// call) so a state is stamped with the reception time on a shared clock.
+  std::uint64_t now_ns = 0;
+};
+
+/// An atomic feedback snapshot: the values and their reception evidence for all
+/// joints, captured together with ONE monotonic clock reading.
+///
+/// WHY THIS EXISTS: reading `feedback()` and `feedbackStats()` as two separate
+/// calls lets a bus that receives a frame *in between* them pair an OLD value
+/// with a NEW age (or vice-versa).  A real bus produces this struct under a
+/// single lock; the default implementation below is only a compatibility
+/// fallback and does not carry that guarantee.
+struct JointBusSnapshot {
+  std::array<JointBusFeedback, kNumJoints> feedback{};
+  std::array<JointBusFeedbackStats, kNumJoints> stats{};
 };
 
 /// Transport-level joint bus.
@@ -86,6 +103,19 @@ class IJointBus {
   /// Reception evidence per joint (see the header comment).
   virtual std::array<JointBusFeedbackStats, kNumJoints> feedbackStats() const =
       0;
+
+  /// Values + reception evidence captured ATOMICALLY (one lock, one clock).
+  ///
+  /// Implementations backed by a real transport override this to read both in a
+  /// single critical section.  The default combines the two separate reads and
+  /// therefore does NOT guarantee value/age consistency - it exists only so a
+  /// bus that has not been upgraded still compiles.
+  virtual JointBusSnapshot snapshot() const {
+    JointBusSnapshot snap;
+    snap.feedback = feedback();
+    snap.stats = feedbackStats();
+    return snap;
+  }
 
   /// Mode-0 stop on every joint.
   virtual void stop() = 0;

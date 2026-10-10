@@ -56,6 +56,7 @@ endfunction()
 # ---------------------------------------------------------------------------
 add_library(r1_robot_core STATIC
   src/config.cpp
+  src/control_service.cpp
   src/gripper.cpp
   src/joint_bus.cpp
   src/limits.cpp

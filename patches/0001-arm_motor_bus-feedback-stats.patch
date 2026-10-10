@@ -1,6 +1,27 @@
---- a/include/arm_motor_bus.h
-+++ b/include/arm_motor_bus.h
-@@ -105,6 +105,23 @@
+Description: Add atomic per-joint feedback reception evidence to ArmMotorBus.
+ Upstream exposes only a sticky feedbackReady() flag and no reception time, and
+ it reads `states()` and the reception evidence as two SEPARATE lock passes. A
+ caller therefore cannot (a) tell "receiving continuously" from "stopped after
+ the first packet", (b) stamp a state with the time the data actually ARRIVED,
+ or (c) get a consistent (value, age) pair.
+
+ This patch adds:
+   * steadyNowNs(): one monotonic clock source (std::chrono::steady_clock, same
+     family as r1_robot::nowNs()) so ages and reads share one epoch.
+   * Per-joint rx bookkeeping (rx_count, last_rx_ns) recorded inside the existing
+     feedback writer, under fb_mutex.
+   * feedbackStats(): the reception evidence on its own.
+   * feedbackSnapshot(): values + reception evidence + a single captured `now`,
+     read together under ONE fb_mutex lock, so an old state can never be paired
+     with a fresh timestamp.  This is the entry point r1_robot uses for readState.
+
+ The submodule is NEVER modified in place: r1_robot copies these two files into
+ the build tree and applies this patch there (cmake/R1SdkDependency.cmake).
+ Version: v2 (adds feedbackSnapshot(); v1 added only feedbackStats()).
+ Pinned against: unitreerobotics/r1-7a_sdk commit 480cfc8c (VERSION 0.1.0).
+--- a/include/arm_motor_bus.h	2026-10-10 16:53:24.994423002 +0800
++++ b/include/arm_motor_bus.h	2026-10-10 16:53:56.072558792 +0800
+@@ -105,6 +105,35 @@
      /** True if every joint has received at least one valid feedback. */
      bool allFeedbackReady() const;
  
@@ -18,19 +39,31 @@
 +        uint64_t packets = 0;   //!< valid (CRC-checked) packets received
 +        bool received = false;  //!< packets > 0
 +        uint64_t age_ns = 0;    //!< time since the last valid packet (0 if none)
++        uint64_t now_ns = 0;    //!< monotonic time `age_ns` was measured against
 +    };
 +    std::array<FeedbackStats, kArmJointCount> feedbackStats() const;
++
++    /**
++     * Feedback values AND their reception evidence, captured together under one
++     * lock (PATCHED ADDITION).  This is the atomic snapshot: a caller must never
++     * pair a value read from one lock pass with an age read from another.
++     */
++    struct FeedbackSnapshot {
++        std::array<ArmJointState, kArmJointCount> states;
++        std::array<FeedbackStats, kArmJointCount> stats;
++    };
++    FeedbackSnapshot feedbackSnapshot() const;
 +
  private:
      struct Impl;
      std::unique_ptr<Impl> impl_;
---- a/src/arm_motor_bus.cpp
-+++ b/src/arm_motor_bus.cpp
+--- a/src/arm_motor_bus.cpp	2026-10-10 16:53:24.994423002 +0800
++++ b/src/arm_motor_bus.cpp	2026-10-10 16:53:56.072558792 +0800
 @@ -16,6 +16,14 @@
  
  namespace {
  
-+/** PATCHED: monotonic nanoseconds (same clock family as std::chrono::steady_clock). */
++/** PATCHED: monotonic nanoseconds (same clock family as r1_robot::nowNs()). */
 +uint64_t steadyNowNs() {
 +    return static_cast<uint64_t>(
 +        std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -70,7 +103,7 @@
      }
      impl_->opened = true;
      std::cout << "[ArmMotorBus] opened " << port << " @ " << baudrate
-@@ -379,3 +395,18 @@
+@@ -379,3 +395,45 @@
      }
      return true;
  }
@@ -86,6 +119,33 @@
 +        out[i].age_ns = (out[i].received && now >= impl_->last_rx_ns[i])
 +                            ? (now - impl_->last_rx_ns[i])
 +                            : 0;
++        out[i].now_ns = now;
 +    }
 +    return out;
++}
++
++ArmMotorBus::FeedbackSnapshot ArmMotorBus::feedbackSnapshot() const {
++    // PATCHED: values and reception evidence under ONE lock, ages measured
++    // against a SINGLE captured `now`.  This is what makes the snapshot atomic:
++    // a stale value can never be paired with a fresh timestamp.
++    std::lock_guard<std::mutex> lock(impl_->fb_mutex);
++    FeedbackSnapshot snap;
++    const uint64_t now = steadyNowNs();
++    for (int i = 0; i < kArmJointCount; ++i) {
++        const auto& m = impl_->latest_motor[i];
++        const auto& cal = impl_->calib[i];
++        snap.states[i].q = motorToUrdfAngle(m.q, cal);
++        snap.states[i].dq = motorToUrdfVec(m.dq, cal);
++        snap.states[i].tau_est = motorToUrdfVec(m.tau_est, cal);
++        snap.states[i].mode = m.mode;
++        snap.states[i].timeout = m.timeout;
++        snap.states[i].error_code = m.error_code;
++        snap.stats[i].packets = impl_->rx_count[i];
++        snap.stats[i].received = impl_->rx_count[i] > 0;
++        snap.stats[i].age_ns = (snap.stats[i].received && now >= impl_->last_rx_ns[i])
++                                   ? (now - impl_->last_rx_ns[i])
++                                   : 0;
++        snap.stats[i].now_ns = now;
++    }
++    return snap;
 +}

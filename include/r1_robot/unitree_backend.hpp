@@ -82,21 +82,19 @@ class UnitreeArmBackend final : public IArmBackend {
   void stop() override;
 
   /// Arm/disarm the backend-level motion gate.  See r1_robot/motion_gate.hpp.
-  /// R1Arm::enableMotion() is the only legitimate caller that passes `true`.
-  void setMotionArmed(bool armed) override { gate_.set(armed); }
+  /// Requires an unforgeable MotionControl token, so only R1Arm or
+  /// ControlService - which mint it after every precondition holds - can arm it.
+  void setMotionArmed(bool armed, const MotionControl& control) override {
+    (void)control;
+    gate_.set(armed);
+  }
   bool motionArmed() const override { return gate_.armed(); }
 
-  /// Send ONE zero-torque FOC frame to every joint.
-  ///
-  /// Motivate: the official SDK notes that the motors only start reporting
-  /// feedback after they receive a control packet, so the very first frame has
-  /// to come from somewhere.
-  ///
-  /// WARNING: this powers the motor bridges (mode 1) with zero gain/torque.
-  /// The arm will be compliant and WILL NOT hold its own weight.  This method
-  /// is never called automatically - an operator must invoke it deliberately
-  /// as part of the bring-up procedure in HARDWARE_BRINGUP.md.
-  bool probeFeedback(std::string* error);
+  /// Send ONE zero-torque FOC frame to every joint (see IArmBackend).  Requires
+  /// a MotionControl token and a live connection; never runs automatically.  An
+  /// operator invokes it through R1Arm::probeFeedbackForBringup() as part of the
+  /// bring-up procedure in HARDWARE_BRINGUP.md.
+  bool probeFeedback(std::string* error, const MotionControl& control) override;
 
   const UnitreeBackendConfig& config() const { return cfg_; }
 

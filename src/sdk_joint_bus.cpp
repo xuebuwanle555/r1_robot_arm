@@ -100,6 +100,33 @@ class SdkJointBus final : public IJointBus {
       dst.received = s.received;
       dst.packets = s.packets;
       dst.age_ns = s.age_ns;
+      dst.now_ns = s.now_ns;
+    }
+    return out;
+  }
+
+  /// Atomic: values + reception evidence from a SINGLE patched-SDK lock pass,
+  /// so a stale joint value can never be paired with a freshly-computed age.
+  JointBusSnapshot snapshot() const override {
+    const ArmMotorBus::FeedbackSnapshot raw = bus_.feedbackSnapshot();
+    JointBusSnapshot out;
+    for (int i = 0; i < kNumJoints; ++i) {
+      const std::size_t si = static_cast<std::size_t>(i);
+      const ArmJointState& s = raw.states[si];
+      JointBusFeedback& fb = out.feedback[si];
+      fb.q = s.q;
+      fb.dq = s.dq;
+      fb.tau_est = s.tau_est;
+      fb.mode = modeFromMotor(s.mode);
+      fb.timeout = (s.timeout != 0);
+      fb.error_code = s.error_code;
+
+      const ArmMotorBus::FeedbackStats& st = raw.stats[si];
+      JointBusFeedbackStats& dst = out.stats[si];
+      dst.received = st.received;
+      dst.packets = st.packets;
+      dst.age_ns = st.age_ns;
+      dst.now_ns = st.now_ns;
     }
     return out;
   }

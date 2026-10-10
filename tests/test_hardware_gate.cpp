@@ -14,8 +14,10 @@
 // ---------------------------------------------------------------------------
 #include <memory>
 #include <string>
+#include <type_traits>
 
 #include "r1_robot/mock_arm.hpp"
+#include "r1_robot/motion_control.hpp"
 #include "r1_robot/motion_gate.hpp"
 #include "r1_robot/r1_arm.hpp"
 #include "r1_robot/types.hpp"
@@ -59,7 +61,12 @@ class GatedRealBackend final : public IArmBackend {
   }
   void stop() override { mock_.stop(); }
 
-  void setMotionArmed(bool armed) override { gate_.set(armed); }
+  // Receives the token but cannot mint one (this test class is not a friend of
+  // MotionControl); it only forwards what R1Arm hands it into the gate.
+  void setMotionArmed(bool armed, const MotionControl& control) override {
+    (void)control;
+    gate_.set(armed);
+  }
   bool motionArmed() const override { return gate_.armed(); }
 
   MockArm& mock() { return mock_; }
@@ -163,4 +170,114 @@ R1_TEST(connecting_a_real_backend_without_the_master_switch_never_arms) {
   R1_CHECK(!arm.connect(&error));
   R1_CHECK(!backend->motionArmed());
   R1_CHECK(!backend->isConnected());
+}
+
+// ---------------------------------------------------------------------------
+// Bypass regressions (Task 1).  These prove the control-permission boundary is
+// enforced structurally, not by convention.
+// ---------------------------------------------------------------------------
+
+// The handle R1Arm hands out must be read-only: it is a `const IArmBackend`, so
+// writeCommand()/stop()/setMotionArmed()/probeFeedback() (all non-const) are
+// ill-formed through it.  A caller that reaches for the backend can poll state
+// but physically cannot drive or arm the motors with it.
+R1_TEST(r1_arm_backend_handle_is_read_only) {
+  static_assert(std::is_const<std::remove_reference<
+                    decltype(*std::declval<const r1_robot::R1Arm&>().backend())>::
+                    type>::value,
+                "R1Arm::backend() must return a const (read-only) handle");
+
+  auto backend = std::make_shared<GatedRealBackend>();
+  R1ArmConfig config;
+  config.safety.allow_real_hardware = true;  // else a real backend won't connect
+  R1Arm arm(backend, config);
+  std::string error;
+  R1_CHECK(arm.connect(&error));
+
+  // Read-only polling compiles and works through the handle.
+  auto view = arm.backend();
+  const RobotState s = view->readState();
+  R1_CHECK(s.connected);
+  R1_CHECK(!view->motionArmed());
+  // (Uncommenting any of these does NOT compile: they are non-const members.)
+  //   view->writeCommand(ArmCommand::stop());
+  //   view->setMotionArmed(true, ...);   // and no token is constructible here
+  //   view->stop();
+}
+
+// Once motion is enabled the backend gate is armed, so a caller that somehow
+// holds a *non-const* backend can push an out-of-envelope frame straight through
+// writeCommand(), skipping SafetyMonitor.  R1Arm::backend() no longer hands such
+// a pointer out - this test documents exactly why that matters.
+R1_TEST(enabled_gate_still_bypasses_safety_via_writecommand_so_backend_is_hidden) {
+  auto backend = std::make_shared<GatedRealBackend>();
+  backend->mock().setJointPositions(filled(0.18));
+  R1ArmConfig config;
+  config.safety.allow_real_hardware = true;
+  R1Arm arm(backend, config);
+
+  std::string error;
+  R1_CHECK(arm.connect(&error));
+  R1_CHECK(arm.enableMotion(true, &error));  // arms the backend gate
+
+  // The legitimate path refuses a command outside max_joint_step_rad...
+  const ArmCommand wild = ArmCommand::position(filled(3.0), 20.0, 3.0);
+  R1_CHECK(!arm.sendAction(wild, &error));
+
+  // ...but the raw backend (which R1Arm::backend() no longer exposes) would
+  // accept it now that the gate is armed.  This is the hole we closed.
+  R1_CHECK(backend->motionArmed());
+  R1_CHECK(backend->writeCommand(wild));
+}
+
+// A business caller cannot fabricate the MotionControl token, so it cannot even
+// name setMotionArmed()/probeFeedback().  We cannot construct a token here for
+// the same reason - that IS the guarantee.  What we can assert is that the
+// gated probe path never secretly arms motion.
+R1_TEST(feedback_probe_does_not_arm_motion) {
+  auto backend = std::make_shared<GatedRealBackend>();
+  backend->mock().setJointPositions(filled(0.18));
+  R1ArmConfig config;
+  config.safety.allow_real_hardware = true;
+  R1Arm arm(backend, config);
+
+  std::string error;
+  R1_CHECK(arm.connect(&error));
+
+  // Refused without human confirmation...
+  R1_CHECK(!arm.probeFeedbackForBringup(/*human_confirmed=*/false, &error));
+  // ...and GatedReal drives no hardware so the interface probe refuses even when
+  // confirmed.  Either way the motion gate stays disarmed and motion stays off.
+  R1_CHECK(!arm.probeFeedbackForBringup(/*human_confirmed=*/true, &error));
+  R1_CHECK(!backend->motionArmed());
+  R1_CHECK(!arm.motionEnabled());
+
+  // Without allow_real_hardware the backend is never even connected, so a
+  // confirmed probe is refused outright.
+  auto backend2 = std::make_shared<GatedRealBackend>();
+  R1Arm arm2(backend2);  // allow_real_hardware = false
+  std::string err2;
+  R1_CHECK(!arm2.probeFeedbackForBringup(/*human_confirmed=*/true, &err2));
+  R1_CHECK(!backend2->motionArmed());
+}
+
+// Motion enable is the ONLY thing that arms; the token cannot be obtained or
+// forged by a caller that merely holds the R1Arm.
+R1_TEST(enable_motion_is_the_only_armed_transition) {
+  auto backend = std::make_shared<GatedRealBackend>();
+  backend->mock().setJointPositions(filled(0.18));
+  R1ArmConfig config;
+  config.safety.allow_real_hardware = true;
+  R1Arm arm(backend, config);
+
+  std::string error;
+  R1_CHECK(arm.connect(&error));
+  R1_CHECK(!backend->motionArmed());
+
+  // Failed enables must never leave the gate armed.
+  R1_CHECK(!arm.enableMotion(/*human_confirmed=*/false, &error));
+  R1_CHECK(!backend->motionArmed());
+
+  R1_CHECK(arm.enableMotion(/*human_confirmed=*/true, &error));
+  R1_CHECK(backend->motionArmed());
 }

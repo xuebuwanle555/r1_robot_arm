@@ -204,12 +204,10 @@ int main(int argc, char** argv) {
       return 1;
     }
 #if defined(R1_ROBOT_WITH_UNITREE_BACKEND)
-    auto* unitree = dynamic_cast<r1_robot::UnitreeArmBackend*>(backend.get());
-    if (unitree == nullptr) {
-      std::cerr << "--probe is only meaningful for the unitree backend\n";
-      return 1;
-    }
-    if (!unitree->probeFeedback(&error)) {
+    // The bring-up tool drives motors only through R1Arm's gated path: the
+    // backend itself refuses a probe to any caller that cannot present an
+    // unforgeable MotionControl token, which only R1Arm can mint.
+    if (!arm.probeFeedbackForBringup(/*human_confirmed=*/true, &error)) {
       std::cerr << "probe failed: " << error << "\n";
       return 1;
     }

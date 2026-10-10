@@ -177,41 +177,47 @@ RobotState UnitreeArmBackend::readState() const {
   }
 
   out.connected = true;
-  const std::array<JointBusFeedback, kNumJoints> fb = impl_->bus->feedback();
-  const std::array<JointBusFeedbackStats, kNumJoints> stats =
-      impl_->bus->feedbackStats();
-  const std::uint64_t now = nowNs();
+  // ONE atomic snapshot: values + reception evidence captured together, so a
+  // stale joint value can never be paired with a fresh age (the two-read race
+  // that existed when feedback() and feedbackStats() were called separately).
+  const JointBusSnapshot snap = impl_->bus->snapshot();
+  // A single monotonic reference (this backend's clock) converts every joint's
+  // age into a reception stamp, so the whole state shares ONE clock epoch.  The
+  // snapshot's own `now_ns` (the instant the bus measured the ages) is retained
+  // for diagnostics/atomicity assertions but is not needed to derive the stamp.
+  const std::uint64_t read_now = nowNs();
 
   std::uint64_t oldest = 0;
   bool any = false;
   for (int i = 0; i < kNumJoints; ++i) {
     const std::size_t si = static_cast<std::size_t>(i);
-    out.q[si] = fb[si].q;
-    out.dq[si] = fb[si].dq;
-    out.tau[si] = fb[si].tau_est;
-    out.mode[si] = fb[si].mode;
-    out.error_code[si] = fb[si].error_code;
+    const JointBusFeedback& fb = snap.feedback[si];
+    const JointBusFeedbackStats& stats = snap.stats[si];
+
+    out.q[si] = fb.q;
+    out.dq[si] = fb.dq;
+    out.tau[si] = fb.tau_est;
+    out.mode[si] = fb.mode;
+    out.error_code[si] = fb.error_code;
     // `valid` reflects "a CRC-valid frame has been received", which is all the
     // bus can prove.  Freshness is carried separately by the timestamps below.
-    out.valid[si] = stats[si].received;
+    out.valid[si] = stats.received;
     // NOT AVAILABLE: the SDK's ArmJointState carries neither voltage nor
     // temperature.  Keep them at 0 ("unknown"); SafetyMonitor skips a 0 V
     // reading instead of guessing.  TODO(bringup): extend if the bus exposes it.
     out.voltage[si] = 0.0;
     out.temperature_c[si] = 0.0;
 
-    // Reception time of the newest valid frame, derived from the bus-reported
-    // age.  NEVER the time of this call.
+    // Reception time of the newest valid frame = read time - age.  NEVER the
+    // time of the next call: stamping at read time would make freshness vacuous.
     std::uint64_t stamp = 0;
-    if (stats[si].received && now > stats[si].age_ns) {
-      stamp = now - stats[si].age_ns;
+    if (stats.received) {
+      stamp = (read_now > stats.age_ns) ? (read_now - stats.age_ns) : read_now;
     }
     out.joint_stamp_ns[si] = stamp;
-    if (stats[si].received) {
-      if (!any || stamp < oldest) {
-        oldest = stamp;
-        any = true;
-      }
+    if (stats.received && (!any || stamp < oldest)) {
+      oldest = stamp;
+      any = true;
     }
   }
 
@@ -257,7 +263,10 @@ void UnitreeArmBackend::stop() {
   }
 }
 
-bool UnitreeArmBackend::probeFeedback(std::string* error) {
+bool UnitreeArmBackend::probeFeedback(std::string* error,
+                                      const MotionControl& control) {
+  (void)control;  // Possession of the token proves the caller is R1Arm or
+                  // ControlService; ordinary business code cannot construct one.
   if (!impl_ || !impl_->opened || !impl_->bus) {
     if (error) {
       *error = "refused: not connected";
