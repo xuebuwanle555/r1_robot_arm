@@ -140,3 +140,183 @@ class TestControlServiceSimBridge(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+@unittest.skipUnless(HAVE_BRIDGE, "C++/sim bridge not built")
+class TestBridgeInputValidation(unittest.TestCase):
+    """Task D: nothing is read out of a NumPy array before its shape, dtype,
+    contiguity and element count have been checked, and every malformed upload
+    turns into an error a Python caller can actually see."""
+
+    def _bringup(self, timeout_s=0.5):
+        """A connected, enabled service parked on a pose inside the soft limits.
+
+        Order matters: connect() reloads SimArm at zero, and the zero pose is
+        already outside J2/J4's soft margin, so the pose has to be set after it.
+        """
+        sim = _make_sim()
+        service = cb.make_control_service(sim, _config(timeout_s=timeout_s))
+        ok, err = service.connect()
+        self.assertTrue(ok, msg=err)
+        sim.set_joint_positions(rr.SAFE_HOME)
+        service.heartbeat()
+        res = service.enable_motion(human_confirmed=True)
+        self.assertTrue(res.ok, msg=res.error)
+        service.heartbeat()
+        service.run_cycle()
+        return service, sim
+
+    def _submit(self, waypoints):
+        service, _ = self._bringup()
+        return service.submit_trajectory(waypoints)
+
+    def test_valid_upload_reports_acceptance(self):
+        r = self._submit([(0, rr.SAFE_HOME.astype(np.float64)),
+                          (int(1e9), GOAL.astype(np.float64))])
+        self.assertTrue(bool(r), msg=r.error)
+        self.assertEqual(r.status, cb.SubmitStatus.ACCEPTED)
+
+    def test_rejects_wrong_element_count(self):
+        short = np.zeros(6, dtype=np.float64)
+        with self.assertRaisesRegex((ValueError, TypeError), "7 elements"):
+            self._submit([(0, short), (int(1e8), short)])
+
+    def test_rejects_wrong_dtype(self):
+        ints = np.zeros(7, dtype=np.int32)
+        with self.assertRaisesRegex(TypeError, "dtype"):
+            self._submit([(0, ints.astype(np.int32)), (int(1e8), ints)])
+
+    def test_rejects_non_contiguous_and_multidimensional(self):
+        wide = np.zeros(14, dtype=np.float64)
+        strided = wide[::2]            # 7 elements, but not contiguous
+        self.assertEqual(strided.shape, (7,))
+        self.assertFalse(strided.flags["C_CONTIGUOUS"])
+        with self.assertRaisesRegex(ValueError, "contiguous"):
+            self._submit([(0, strided), (int(1e8), strided)])
+        nested = np.zeros((7, 1), dtype=np.float64)
+        with self.assertRaisesRegex(ValueError, "1-dimensional"):
+            self._submit([(0, nested), (int(1e8), nested)])
+
+    def test_rejects_malformed_waypoint_pairs(self):
+        for bad in ([(0,)], [((0, GOAL, GOAL), GOAL)], ["not a pair"]):
+            with self.assertRaises((ValueError, TypeError)):
+                self._submit(bad)
+
+    def test_rejects_negative_timestamps_and_non_arrays(self):
+        with self.assertRaises(ValueError):
+            self._submit([(-1, GOAL.astype(np.float64)),
+                          (int(1e8), GOAL.astype(np.float64))])
+        with self.assertRaises((TypeError, ValueError)):
+            self._submit([(0, {"q": 1}), (int(1e8), GOAL.astype(np.float64))])
+
+    def test_empty_and_too_short_plans_are_refused_not_raised(self):
+        # A structurally fine upload that the C++ admission check rejects comes
+        # back as a SubmitResult, because nothing was executed.
+        r = self._submit([])
+        self.assertFalse(bool(r))
+        self.assertIn("waypoint", r.error)
+
+    def test_non_finite_waypoint_is_refused_by_the_service(self):
+        bad = GOAL.astype(np.float64).copy()
+        bad[2] = np.nan
+        r = self._submit([(0, rr.SAFE_HOME.astype(np.float64)), (int(1e9), bad)])
+        self.assertFalse(bool(r))
+        self.assertIn("finite", r.error)
+
+    def test_a_plain_list_of_seven_floats_is_accepted(self):
+        r = self._submit([(0, [0.0, 0.3, 0.3, 0.3, 0.0, 0.0, 0.0]),
+                          (int(1e9), list(GOAL))])
+        self.assertTrue(bool(r), msg=r.error)
+
+
+class _RaisingArm:
+    """A backend whose actuating call explodes, standing in for a SimArm that
+    dies mid-step.  The C++ side must surface it as a fault, not swallow it."""
+
+    name = "raising-sim"
+
+    def __init__(self):
+        self._inner = _make_sim()
+
+    def __getattr__(self, item):
+        return getattr(self._inner, item)
+
+    def write_command(self, cmd):
+        raise RuntimeError("sim lost the plot")
+
+
+@unittest.skipUnless(HAVE_BRIDGE, "C++/sim bridge not built")
+class TestBridgeFailurePaths(unittest.TestCase):
+    def test_python_exception_becomes_an_explicit_send_failure(self):
+        arm = _RaisingArm()
+        cfg = _config(timeout_s=0.5)
+        service = cb.make_control_service(arm, cfg)
+        ok, err = service.connect()
+        self.assertTrue(ok, msg=err)
+        # Park AFTER connect(): connect() reloads the model at zero, and the
+        # zero pose is already outside J2/J4's soft margin, which would fault
+        # for the wrong reason.
+        arm.set_joint_positions(rr.SAFE_HOME)
+        res = service.enable_motion(human_confirmed=True)
+        self.assertTrue(res.ok, msg=res.error)
+        service.heartbeat()
+        service.run_cycle()
+
+        self.assertTrue(service.fault_latched())
+        self.assertEqual(service.last_fault_code(), "bus.send_failed")
+        self.assertEqual(service.state(), cb.ServiceState.CONTROLLED_STOP)
+        self.assertEqual(service.stop_reason(), cb.StopReason.UNSAFE_STATE)
+        self.assertGreaterEqual(service.metrics().send_failures, 1)
+
+    def test_bridge_backend_is_never_treated_as_real_hardware(self):
+        # allow_real_hardware stays False, yet enabling works: the service sees a
+        # simulation backend, so the hardware gates are simply not in play.
+        sim = _make_sim()
+        self.assertFalse(sim.is_real_hardware)
+        cfg = _config(timeout_s=0.5)
+        cfg.allow_real_hardware = False
+        service = cb.make_control_service(sim, cfg)
+        self.assertTrue(service.connect()[0])
+        self.assertTrue(service.enable_motion(human_confirmed=True).ok)
+
+
+@unittest.skipUnless(HAVE_BRIDGE, "C++/sim bridge not built")
+class TestIndependentWatchdog(unittest.TestCase):
+    """Task D, item 4: the watchdog has to be proven without Python cooperating.
+
+    The synchronous `run_cycle()` tests schedule the C++ cycle from Python, so
+    they can only ever show that the service reacts when it is *told* to look.
+    Here the C++ service owns its own periodic thread and Python calls nothing at
+    all after startup; the timeout must latch on its own.
+    """
+
+    def test_timeout_latches_with_no_run_cycle_call_from_python(self):
+        sim = _make_sim()
+        cfg = _config(timeout_s=0.3)
+        cfg.period_ns = 5_000_000          # 5 ms
+        service = cb.make_control_service(sim, cfg)
+
+        ok, err = service.connect()
+        self.assertTrue(ok, msg=err)
+        sim.set_joint_positions(rr.SAFE_HOME)
+        service.heartbeat()
+        self.assertTrue(service.enable_motion(human_confirmed=True).ok)
+
+        service.start()
+        try:
+            # Python goes completely silent: no heartbeat, no run_cycle.
+            deadline = time.monotonic() + 3.0
+            while time.monotonic() < deadline and not service.fault_latched():
+                time.sleep(0.02)
+
+            self.assertTrue(service.fault_latched(),
+                            "the C++ thread never noticed the silence")
+            self.assertEqual(service.last_fault_code(), "comm.watchdog_timeout")
+            self.assertEqual(service.stop_reason(),
+                             cb.StopReason.UPPER_LAYER_TIMEOUT)
+            self.assertEqual(service.state(), cb.ServiceState.CONTROLLED_STOP)
+            # A timeout never restores motion by itself.
+            self.assertFalse(service.enable_motion(human_confirmed=True).ok)
+            self.assertGreater(service.metrics().cycles, 0)
+        finally:
+            service.stop()
