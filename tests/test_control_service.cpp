@@ -13,8 +13,10 @@
 //   * only ControlService arms the backend (it owns the sole write path);
 //   * a value can never be paired with a mismatched reception time.
 // ---------------------------------------------------------------------------
+#include <cmath>
 #include <cstdint>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -239,15 +241,20 @@ R1_TEST(control_service_rejects_unsafe_trajectory) {
   wp[0].q = filled(0.1);
   wp[1].t_ns = 1000 * kMs;
   wp[1].q = filled(3.2);
-  h.service->submitTrajectory(wp);
+  auto r = h.service->submitTrajectory(wp);
 
-  // The up-front envelope check latches on submit; the cycle then holds.
+  // Task B moved this from "latch a fault and stop the arm" to "refuse the
+  // upload and keep holding": nothing was executed, so nothing is faulty.
+  R1_CHECK(!r.ok());
+  R1_CHECK_CONTAINS(r.error, "limit");
+  R1_CHECK(!h.service->faultLatched());
+
   h.bus->tick(kMs);
   h.receiveAll();
+  h.service->heartbeat();
   h.service->runCycle();
-
-  R1_CHECK(h.service->faultLatched());
-  R1_CHECK_EQ(h.service->lastFaultCode(), std::string("cmd.out_of_limits"));
+  R1_CHECK(h.service->state() == ServiceState::kSoftwareHold);
+  R1_CHECK(!h.bus->lastCommands()[0].timed_out);
 }
 
 R1_TEST(control_service_clear_fault_requires_a_fresh_enable) {
@@ -582,3 +589,218 @@ R1_TEST(stop_hold_target_uses_the_last_commanded_setpoint_not_stale_feedback) {
   R1_CHECK_NEAR(hold[0].q, 0.15, 1e-9);
 }
 
+
+// ===========================================================================
+// Task B - trajectory / command admission.  Everything is validated when it is
+// uploaded and refused with a reason, because a target that is only caught (or
+// worse, clamped away) once per cycle is an unsafe trajectory being executed.
+// A rejection must leave the service holding and must NOT latch a fault: the
+// caller made a mistake, nothing dangerous happened.
+// ===========================================================================
+
+namespace {
+
+std::vector<TrajWaypoint> twoPointTraj(double q_from, double q_to,
+                                       std::uint64_t dur_ns) {
+  std::vector<TrajWaypoint> wp(2);
+  wp[0].t_ns = 0;
+  wp[0].q = filled(q_from);
+  wp[1].t_ns = dur_ns;
+  wp[1].q = filled(q_to);
+  return wp;
+}
+
+}  // namespace
+
+R1_TEST(submit_trajectory_accepts_a_valid_plan_without_a_fault) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  auto r = h.service->submitTrajectory(twoPointTraj(0.1, 0.2, 200 * kMs));
+  R1_CHECK(r.ok());
+  R1_CHECK(!h.service->faultLatched());
+  R1_CHECK(h.service->state() == ServiceState::kTrackingTrajectory);
+}
+
+R1_TEST(submit_trajectory_rejects_a_non_finite_waypoint) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  auto wp = twoPointTraj(0.1, 0.2, 200 * kMs);
+  wp[1].q[2] = std::numeric_limits<double>::quiet_NaN();
+  auto r = h.service->submitTrajectory(wp);
+  R1_CHECK(!r.ok());
+  R1_CHECK_CONTAINS(r.error, "finite");
+  R1_CHECK_EQ(r.waypoint_index, 1);
+  R1_CHECK(!h.service->faultLatched());
+  R1_CHECK(h.service->state() == ServiceState::kSoftwareHold);  // kept holding
+
+  // Nothing was buffered: the next cycle still commands the old hold, not NaN.
+  h.bus->tick(kMs);
+  h.receiveAll();
+  h.service->heartbeat();
+  h.service->runCycle();
+  R1_CHECK(h.bus->lastCommands()[0].mode == ControlMode::kFoc);
+  R1_CHECK(std::isfinite(h.bus->lastCommands()[0].q));
+}
+
+R1_TEST(submit_trajectory_rejects_unordered_or_zero_length_segments) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  std::vector<TrajWaypoint> back(3);
+  back[0].t_ns = 0;         back[0].q = filled(0.1);
+  back[1].t_ns = 200 * kMs; back[1].q = filled(0.15);
+  back[2].t_ns = 100 * kMs; back[2].q = filled(0.2);  // time runs backwards
+  auto r1 = h.service->submitTrajectory(back);
+  R1_CHECK(!r1.ok());
+  R1_CHECK_CONTAINS(r1.error, "time");
+
+  auto same = twoPointTraj(0.1, 0.15, 0);  // zero-duration segment
+  auto r2 = h.service->submitTrajectory(same);
+  R1_CHECK(!r2.ok());
+  R1_CHECK_CONTAINS(r2.error, "time");
+
+  R1_CHECK(!h.service->faultLatched());
+}
+
+R1_TEST(submit_trajectory_respects_the_waypoint_count_and_horizon) {
+  Harness h;
+  h.cfg.max_traj_points = 4;
+  h.cfg.max_traj_duration_ns = 1000 * kMs;
+  h.service = std::make_shared<ControlService>(h.backend, h.cfg);
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  std::vector<TrajWaypoint> many(6);
+  for (std::size_t i = 0; i < many.size(); ++i) {
+    many[i].t_ns = static_cast<std::uint64_t>(i) * 100 * kMs;
+    many[i].q = filled(0.1);
+  }
+  auto rc = h.service->submitTrajectory(many);
+  R1_CHECK(!rc.ok());
+  R1_CHECK_CONTAINS(rc.error, "waypoint");
+
+  auto long_traj = twoPointTraj(0.1, 0.2, 5000 * kMs);
+  auto rd = h.service->submitTrajectory(long_traj);
+  R1_CHECK(!rd.ok());
+  R1_CHECK_CONTAINS(rd.error, "duration");
+  R1_CHECK(!h.service->faultLatched());
+}
+
+R1_TEST(submit_trajectory_rejects_velocity_and_acceleration_violations) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  // 0.1 rad in 20 ms is 5 rad/s, far above the 1.0 rad/s ceiling.
+  auto fast = twoPointTraj(0.1, 0.2, 20 * kMs);
+  auto rv = h.service->submitTrajectory(fast);
+  R1_CHECK(!rv.ok());
+  R1_CHECK_CONTAINS(rv.error, "velocity");
+
+  // +/-0.5 rad/s reversing over 200 ms is 5 rad/s^2; allowed is 1.
+  Harness h2;
+  h2.cfg.max_joint_accel_rad_s2 = 1.0;
+  h2.service = std::make_shared<ControlService>(h2.backend, h2.cfg);
+  R1_CHECK(h2.bringup());
+  h2.alive();
+  std::vector<TrajWaypoint> flip(3);
+  flip[0].t_ns = 0;         flip[0].q = filled(0.1);
+  flip[1].t_ns = 200 * kMs; flip[1].q = filled(0.2);
+  flip[2].t_ns = 400 * kMs; flip[2].q = filled(0.1);
+  auto ra = h2.service->submitTrajectory(flip);
+  R1_CHECK(!ra.ok());
+  R1_CHECK_CONTAINS(ra.error, "acceleration");
+  R1_CHECK(!h2.service->faultLatched());
+}
+
+R1_TEST(submit_trajectory_rejects_an_out_of_limits_destination_without_latching) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  // Beyond the soft upper limit of joint 0 (URDF max ~2.723).
+  auto r = h.service->submitTrajectory(twoPointTraj(0.1, 3.2, 1000 * kMs));
+  R1_CHECK(!r.ok());
+  R1_CHECK_CONTAINS(r.error, "limit");
+  R1_CHECK_EQ(r.waypoint_index, 1);
+  // The old behaviour was to latch cmd.out_of_limits and stop the arm.  An
+  // un-executed upload is the caller's error, not a machine fault.
+  R1_CHECK(!h.service->faultLatched());
+  R1_CHECK(h.service->state() == ServiceState::kSoftwareHold);
+}
+
+R1_TEST(submit_trajectory_refuses_without_valid_feedback) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  h.bus->tick(100 * kMs);  // no frames: feedback is stale
+  h.service->heartbeat();
+  h.service->runCycle();
+  R1_CHECK(h.service->faultLatched());  // staleness is still a real fault
+
+  auto r = h.service->submitTrajectory(twoPointTraj(0.2, 0.3, 200 * kMs));
+  R1_CHECK(!r.ok());  // refused: nothing may be planned off stale feedback
+}
+
+R1_TEST(submit_trajectory_synthesizes_a_lead_in_instead_of_jumping) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();  // measured and commanded are 0.1
+
+  // Starts 0.5 rad away from where the arm actually is.
+  auto r = h.service->submitTrajectory(twoPointTraj(0.4, 0.45, 200 * kMs));
+  R1_CHECK(r.ok());
+  R1_CHECK_CONTAINS(r.error, "lead_in");  // reported, not hidden
+
+  // The very first commanded frame must leave the measured pose, not the
+  // waypoint: no 0.5 rad step in one cycle.
+  h.bus->tick(kMs);
+  h.receiveAll();
+  h.service->heartbeat();
+  h.service->runCycle();
+  const double first = h.bus->lastCommands()[0].q;
+  R1_CHECK(first <= 0.1 + h.cfg.safety.max_joint_step_rad + 1e-9);
+  R1_CHECK(first < 0.5);
+}
+
+R1_TEST(submit_trajectory_rejects_a_start_offset_beyond_the_lead_in_budget) {
+  Harness h;
+  h.cfg.traj_lead_in_max_ns = 10 * kMs;  // 10 ms of lead-in at most
+  h.service = std::make_shared<ControlService>(h.backend, h.cfg);
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  auto r = h.service->submitTrajectory(twoPointTraj(0.4, 0.45, 200 * kMs));
+  R1_CHECK(!r.ok());
+  R1_CHECK_CONTAINS(r.error, "start");
+  R1_CHECK(!h.service->faultLatched());
+}
+
+R1_TEST(submit_command_returns_a_reason_and_keeps_holding) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  ArmCommand nan_cmd = ArmCommand::position(filled(0.2), 20.0, 3.0);
+  nan_cmd.joints[1].q = std::numeric_limits<double>::quiet_NaN();
+  auto rn = h.service->submitCommand(nan_cmd);
+  R1_CHECK(!rn.ok());
+  R1_CHECK_CONTAINS(rn.error, "finite");
+
+  auto rf = h.service->submitCommand(ArmCommand::position(filled(3.2), 20.0, 3.0));
+  R1_CHECK(!rf.ok());
+  R1_CHECK_CONTAINS(rf.error, "limit");
+
+  R1_CHECK(!h.service->faultLatched());
+  h.bus->tick(kMs);
+  h.receiveAll();
+  h.service->heartbeat();
+  h.service->runCycle();
+  R1_CHECK_NEAR(h.bus->lastCommands()[0].q, 0.1, 1e-9);  // still the old hold
+}

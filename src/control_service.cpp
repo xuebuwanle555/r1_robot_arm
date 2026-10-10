@@ -231,10 +231,44 @@ void ControlService::heartbeat() {
   last_upper_contact_ns_ = now();
 }
 
-void ControlService::submitCommand(const ArmCommand& cmd) {
+SubmitResult ControlService::submitCommand(const ArmCommand& cmd) {
   std::lock_guard<std::mutex> lock(mutex_);
-  if (fault_latched_ || !motion_enabled_) {
-    return;  // refused while latched / not enabled; a stop may still be issued
+  const std::uint64_t t = now();
+  if (fault_latched_) {
+    return SubmitResult::reject("refused: a fault is latched; clear it first");
+  }
+  if (!motion_enabled_) {
+    return SubmitResult::reject("refused: motion is not enabled");
+  }
+  for (int j = 0; j < kNumJoints; ++j) {
+    if (!std::isfinite(cmd.joints[j].q) || !std::isfinite(cmd.joints[j].kp) ||
+        !std::isfinite(cmd.joints[j].kd) || !std::isfinite(cmd.joints[j].tau)) {
+      return SubmitResult::reject(
+          "refused: command joint " + std::to_string(j + 1) +
+          " is not finite",
+          j);
+    }
+  }
+  if (!feedbackTrustedLocked(t)) {
+    return SubmitResult::reject(
+        "refused: feedback is not valid, so the command target cannot be "
+        "checked against where the arm actually is");
+  }
+  // A direct setpoint is checked against the envelope it must run in.
+  // Reachability from the current pose remains the per-cycle ramp's job; a
+  // target outside every soft limit is refused here instead of being crept
+  // toward forever by clamped frames.
+  for (int j = 0; j < kNumJoints; ++j) {
+    const JointLimits& lim = config_.limits.joints[static_cast<std::size_t>(j)];
+    const double centre = 0.5 * (lim.lower + lim.upper);
+    const double lo = std::min(lim.lower + config_.safety.soft_limit_margin, centre);
+    const double hi = std::max(lim.upper - config_.safety.soft_limit_margin, centre);
+    if (cmd.joints[j].q < lo || cmd.joints[j].q > hi) {
+      return SubmitResult::reject(
+          "refused: command joint " + std::to_string(j + 1) +
+          " is outside the soft limit",
+          j);
+    }
   }
   pending_cmd_ = cmd;
   has_pending_cmd_ = true;
@@ -243,38 +277,188 @@ void ControlService::submitCommand(const ArmCommand& cmd) {
   if (state_ == ServiceState::kEnabling) {
     state_ = ServiceState::kTrackingTrajectory;
   }
+  return SubmitResult::accepted();
 }
 
-void ControlService::submitTrajectory(const std::vector<TrajWaypoint>& waypoints) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (fault_latched_ || !motion_enabled_ || waypoints.size() < 2) {
-    return;
+SubmitResult ControlService::validateTrajectoryLocked(
+    const std::vector<TrajWaypoint>& in, std::uint64_t t,
+    std::vector<TrajWaypoint>* out) const {
+  if (fault_latched_) {
+    return SubmitResult::reject("refused: a fault is latched; clear it first");
   }
-  // Up-front envelope check: an out-of-limits destination must be refused now,
-  // not crept toward one ramped step at a time.  Per-cycle validation of the
-  // ramped frame would otherwise mask the violation (each step is in-limit even
-  // though the goal is not).
-  for (const TrajWaypoint& wp : waypoints) {
-    for (int i = 0; i < kNumJoints; ++i) {
-      const std::size_t si = static_cast<std::size_t>(i);
-      const JointLimits& lim = config_.limits.joints[si];
+  if (!motion_enabled_) {
+    return SubmitResult::reject("refused: motion is not enabled");
+  }
+  if (in.size() < 2) {
+    return SubmitResult::reject("refused: a trajectory needs at least 2 waypoints");
+  }
+  if (in.size() > config_.max_traj_points) {
+    return SubmitResult::reject(
+        "refused: " + std::to_string(in.size()) + " waypoints exceeds the maximum of " +
+        std::to_string(config_.max_traj_points));
+  }
+
+  // 1) every waypoint: finite, and inside the soft limits.
+  for (std::size_t i = 0; i < in.size(); ++i) {
+    for (int j = 0; j < kNumJoints; ++j) {
+      if (!std::isfinite(in[i].q[j])) {
+        return SubmitResult::reject(
+            "refused: waypoint " + std::to_string(i) + " joint " +
+                std::to_string(j + 1) + " is not finite",
+            static_cast<int>(i));
+      }
+      const JointLimits& lim = config_.limits.joints[static_cast<std::size_t>(j)];
       const double centre = 0.5 * (lim.lower + lim.upper);
-      const double lo = std::min(lim.lower + config_.safety.soft_limit_margin, centre);
-      const double hi = std::max(lim.upper - config_.safety.soft_limit_margin, centre);
-      if (wp.q[si] < lo || wp.q[si] > hi) {
-        latchFaultLocked("cmd.out_of_limits");
-        beginControlledStopLocked(StopReason::kUnsafeState);
-        return;
+      const double lo =
+          std::min(lim.lower + config_.safety.soft_limit_margin, centre);
+      const double hi =
+          std::max(lim.upper - config_.safety.soft_limit_margin, centre);
+      if (in[i].q[j] < lo || in[i].q[j] > hi) {
+        return SubmitResult::reject(
+            "refused: waypoint " + std::to_string(i) + " joint " +
+                std::to_string(j + 1) + " is outside the soft limit",
+            static_cast<int>(i));
       }
     }
   }
-  traj_ = waypoints;
+
+  // 2) timestamps strictly increase (a zero-length segment is infinite speed).
+  for (std::size_t i = 1; i < in.size(); ++i) {
+    if (in[i].t_ns <= in[i - 1].t_ns) {
+      return SubmitResult::reject(
+          "refused: waypoint " + std::to_string(i) +
+              " time must be strictly after the previous one",
+          static_cast<int>(i));
+    }
+  }
+  const std::uint64_t span = in.back().t_ns - in.front().t_ns;
+  if (span > config_.max_traj_duration_ns) {
+    return SubmitResult::reject(
+        "refused: trajectory duration " + std::to_string(span / 1000000ULL) +
+        " ms exceeds the maximum of " +
+        std::to_string(config_.max_traj_duration_ns / 1000000ULL) + " ms");
+  }
+
+  // 3) per-joint velocity and acceleration over the whole plan.
+  for (std::size_t i = 0; i + 1 < in.size(); ++i) {
+    const double dt_s =
+        static_cast<double>(in[i + 1].t_ns - in[i].t_ns) * 1e-9;
+    for (int j = 0; j < kNumJoints; ++j) {
+      const JointLimits& lim = config_.limits.joints[static_cast<std::size_t>(j)];
+      double vlim = config_.safety.max_abs_velocity;
+      if (lim.max_velocity > 0.0) {
+        vlim = std::min(vlim, lim.max_velocity);
+      }
+      const double v =
+          std::fabs(in[i + 1].q[j] - in[i].q[j]) / std::max(dt_s, 1e-12);
+      if (v > vlim) {
+        return SubmitResult::reject(
+            "refused: segment " + std::to_string(i) + " joint " +
+                std::to_string(j + 1) + " needs " + std::to_string(v) +
+                " rad/s, above the " + std::to_string(vlim) + " rad/s velocity limit",
+            static_cast<int>(i));
+      }
+    }
+  }
+  for (std::size_t i = 1; i + 1 < in.size(); ++i) {
+    const double dt_prev =
+        static_cast<double>(in[i].t_ns - in[i - 1].t_ns) * 1e-9;
+    const double dt_next =
+        static_cast<double>(in[i + 1].t_ns - in[i].t_ns) * 1e-9;
+    const double window = 0.5 * (dt_prev + dt_next);
+    for (int j = 0; j < kNumJoints; ++j) {
+      const double v_prev =
+          (in[i].q[j] - in[i - 1].q[j]) / std::max(dt_prev, 1e-12);
+      const double v_next =
+          (in[i + 1].q[j] - in[i].q[j]) / std::max(dt_next, 1e-12);
+      const double a = std::fabs(v_next - v_prev) / std::max(window, 1e-12);
+      if (a > config_.max_joint_accel_rad_s2) {
+        return SubmitResult::reject(
+            "refused: waypoint " + std::to_string(i) + " joint " +
+                std::to_string(j + 1) + " needs " + std::to_string(a) +
+                " rad/s^2, above the " +
+                std::to_string(config_.max_joint_accel_rad_s2) +
+                " rad/s^2 acceleration limit (HARDWARE_UNVERIFIED value)",
+            static_cast<int>(i));
+      }
+    }
+  }
+
+  // 4) explicit start transition.  The plan must be reachable from where the
+  //    arm actually is; otherwise the first commanded frame would be a jump.
+  //    The lead-in is a real segment, so the whole plan is shifted later rather
+  //    than having its timings bent.
+  if (!feedbackTrustedLocked(t)) {
+    return SubmitResult::reject(
+        "refused: feedback is not valid, so no start transition to the first "
+        "waypoint can be computed");
+  }
+  double need_s = 0.0;
+  for (int j = 0; j < kNumJoints; ++j) {
+    const JointLimits& lim = config_.limits.joints[static_cast<std::size_t>(j)];
+    double vlim = config_.safety.max_abs_velocity;
+    if (lim.max_velocity > 0.0) {
+      vlim = std::min(vlim, lim.max_velocity);
+    }
+    need_s = std::max(
+        need_s, std::fabs(in.front().q[j] - latest_state_.q[j]) / std::max(vlim, 1e-9));
+  }
+  if (need_s <= 1e-9) {
+    *out = in;  // already starting from the measured pose
+    return SubmitResult::accepted();
+  }
+
+  std::uint64_t lead_ns =
+      static_cast<std::uint64_t>(need_s * 1e9) + config_.period_ns;
+  if (lead_ns > config_.traj_lead_in_max_ns) {
+    return SubmitResult::reject(
+        "refused: the start offset needs " +
+        std::to_string(lead_ns / 1000000ULL) +
+        " ms of lead-in, above the " +
+        std::to_string(config_.traj_lead_in_max_ns / 1000000ULL) +
+        " ms budget; move to a reachable start or raise the budget");
+  }
+  if (span + lead_ns > config_.max_traj_duration_ns) {
+    return SubmitResult::reject(
+        "refused: trajectory plus its lead-in exceeds the maximum duration");
+  }
+
+  TrajWaypoint start;
+  start.t_ns = in.front().t_ns;
+  start.q = latest_state_.q;
+  out->clear();
+  out->reserve(in.size() + 1);
+  out->push_back(start);
+  for (const TrajWaypoint& wp : in) {
+    TrajWaypoint shifted = wp;
+    shifted.t_ns += lead_ns;
+    out->push_back(shifted);
+  }
+  SubmitResult ok = SubmitResult::accepted();
+  ok.error = "accepted with a synthesized lead_in of " +
+             std::to_string(lead_ns / 1000000ULL) + " ms";
+  return ok;
+}
+
+SubmitResult ControlService::submitTrajectory(
+    const std::vector<TrajWaypoint>& waypoints) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  const std::uint64_t t = now();
+  std::vector<TrajWaypoint> buffered;
+  SubmitResult r = validateTrajectoryLocked(waypoints, t, &buffered);
+  if (!r.ok()) {
+    // Nothing is stored and no fault is latched: an upload that was never
+    // executed is a caller error, not a machine fault.
+    return r;
+  }
+  traj_ = std::move(buffered);
   has_pending_cmd_ = false;
   traj_upload_ns_ = now();
   last_upper_contact_ns_ = traj_upload_ns_;
-  last_target_ = waypoints.front().q;
+  last_target_ = traj_.front().q;
   has_last_target_ = true;
   state_ = ServiceState::kTrackingTrajectory;
+  return r;
 }
 
 void ControlService::requestControlledStop() {

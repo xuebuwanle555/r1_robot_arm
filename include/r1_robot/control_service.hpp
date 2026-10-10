@@ -106,6 +106,21 @@ struct ControlServiceConfig {
   double hold_kp = 40.0;
   double hold_kd = 3.0;
 
+  // -- trajectory admission ------------------------------------------------
+  // These bound what may be uploaded at all, so an unsafe trajectory is refused
+  // up front instead of being executed and then clamped frame by frame.
+  std::size_t max_traj_points = 512;
+  std::uint64_t max_traj_duration_ns = 60ULL * 1000ULL * 1000ULL * 1000ULL;
+
+  /// Peak joint acceleration a uploaded trajectory may ask for [rad/s^2].
+  /// TODO(bringup) HARDWARE_UNVERIFIED: not measured on an R1.
+  double max_joint_accel_rad_s2 = 5.0;
+
+  /// Upper bound on the synthesized lead-in that brings the arm from its
+  /// measured pose onto the first waypoint.  A start offset that needs more
+  /// than this is refused rather than silently crept toward.
+  std::uint64_t traj_lead_in_max_ns = 5ULL * 1000ULL * 1000ULL * 1000ULL;
+
   /// Monotonic clock source.  Defaults to r1_robot::nowNs().  Tests inject a
   /// virtual clock (shared with the mock backend) to drive the watchdog and
   /// trajectory timing deterministically with no sleeps.
@@ -122,6 +137,33 @@ struct TrajWaypoint {
 struct EnableResult {
   bool ok = false;
   std::string error;
+};
+
+/// Whether a submission was taken.  A rejection is NOT a fault: nothing was
+/// executed, the service keeps holding, and the caller gets a reason back.
+enum class SubmitStatus { kAccepted, kRejected };
+
+struct SubmitResult {
+  SubmitStatus status = SubmitStatus::kRejected;
+  std::string error;
+  /// Waypoint index the rejection refers to, -1 when it is not per-waypoint.
+  int waypoint_index = -1;
+
+  bool ok() const { return status == SubmitStatus::kAccepted; }
+  operator bool() const { return ok(); }
+
+  static SubmitResult accepted() {
+    SubmitResult r;
+    r.status = SubmitStatus::kAccepted;
+    return r;
+  }
+  static SubmitResult reject(const std::string& reason, int index = -1) {
+    SubmitResult r;
+    r.status = SubmitStatus::kRejected;
+    r.error = reason;
+    r.waypoint_index = index;
+    return r;
+  }
 };
 
 /// A snapshot of service status for an upper layer to poll.
@@ -157,9 +199,12 @@ class ControlService {
   /// Heartbeat: proves the upper layer is alive even while idle.
   void heartbeat();
   /// Submit one setpoint frame (position + gains); resets the watchdog.
-  void submitCommand(const ArmCommand& cmd);
+  /// Refused (with a reason) unless motion is enabled, no fault is latched and
+  /// the target is admissible from the current, valid feedback.
+  SubmitResult submitCommand(const ArmCommand& cmd);
   /// Buffer a trajectory and start tracking it; resets the watchdog.
-  void submitTrajectory(const std::vector<TrajWaypoint>& waypoints);
+  /// Fully validated before anything is stored; see validateTrajectoryLocked.
+  SubmitResult submitTrajectory(const std::vector<TrajWaypoint>& waypoints);
   /// Request a controlled stop now (does not clear a latched fault).
   void requestControlledStop();
 
@@ -204,6 +249,11 @@ class ControlService {
   /// valid and fresh.  Assumes mutex_ held.
   bool feedbackTrustedLocked(std::uint64_t t) const;
   static StopReason stopReasonForFault(const std::string& code);
+  /// Full admission check for an uploaded trajectory.  On success `out` holds
+  /// the buffered copy, including any synthesized lead-in segment.
+  SubmitResult validateTrajectoryLocked(const std::vector<TrajWaypoint>& in,
+                                        std::uint64_t t,
+                                        std::vector<TrajWaypoint>* out) const;
 
   ArmBackendPtr backend_;
   ControlServiceConfig config_;
