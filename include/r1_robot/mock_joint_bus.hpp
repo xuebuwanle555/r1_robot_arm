@@ -24,6 +24,7 @@
 // ---------------------------------------------------------------------------
 
 #include <array>
+#include <atomic>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -75,7 +76,10 @@ class MockJointBus final : public IJointBus {
   }
 
   void step(const std::array<JointBusCommand, kNumJoints>& cmds) override {
+    std::lock_guard<std::mutex> gate(io_gate_);
+    entered_io_.store(true);
     std::lock_guard<std::mutex> lock(mutex_);
+    ++write_attempts_;
     if (!is_open_) {
       return;
     }
@@ -106,7 +110,14 @@ class MockJointBus final : public IJointBus {
 
   /// Atomic: values + evidence from ONE clock reading (mirrors the patched SDK).
   JointBusSnapshot snapshot() const override {
+    // Gate first, internal lock second: a blocked transport must never also
+    // freeze the mock's own inspection accessors.
+    std::lock_guard<std::mutex> gate(io_gate_);
+    entered_io_.store(true);
     std::lock_guard<std::mutex> lock(mutex_);
+    if (wall_clock_) {
+      clock_ns_ = r1_robot::nowNs();
+    }
     JointBusSnapshot snap;
     snap.feedback = fb_;
     snap.stats = statsLocked();
@@ -185,6 +196,52 @@ class MockJointBus final : public IJointBus {
 
   void setFailOpen(bool fail) { fail_open_ = fail; }
 
+  /// Make every subsequent frame send fail, as a wedged transport / rejected
+  /// CAN write would.  Used to prove the service turns a silent send failure
+  /// into an explicit fault instead of carrying on as if the arm was commanded.
+  void setFailWrite(bool fail) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    fail_write_ = fail;
+  }
+  bool failWrite() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return fail_write_;
+  }
+
+  /// Stamp feedback with the process monotonic clock instead of the virtual
+  /// one, so a test that drives the service from a real thread can keep the
+  /// bus and the service watchdog on the same time base.
+  void useWallClock(bool on) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    wall_clock_ = on;
+    if (on) {
+      clock_ns_ = r1_robot::nowNs();
+    }
+  }
+
+  /// Block the next transport call (read or write) until `unblockIo()`.  Stands
+  /// in for a call that never returns - a wedged serial port, or the pybind
+  /// bridge's Python callback hanging - so the service's lock discipline can be
+  /// tested against a genuinely stuck backend.
+  void blockIo() {
+    io_gate_.lock();
+    io_blocked_.store(true);
+  }
+  void unblockIo() {
+    // Only the thread that armed the gate may release it: try_lock from the
+    // holder of a non-recursive mutex never succeeds, and the blocked caller
+    // would wait forever.
+    if (io_blocked_.exchange(false)) {
+      io_gate_.unlock();
+    }
+  }
+  bool enteredIo() const { return entered_io_.load(); }
+
+  std::uint64_t writeAttemptCount() const {
+    std::lock_guard<std::mutex> lock(mutex_);
+    return write_attempts_;
+  }
+
   std::uint64_t stepCount() const {
     std::lock_guard<std::mutex> lock(mutex_);
     return step_count_;
@@ -216,9 +273,15 @@ class MockJointBus final : public IJointBus {
   mutable std::mutex mutex_;
   bool is_open_ = false;
   bool fail_open_ = false;
+  bool fail_write_ = false;
+  bool wall_clock_ = false;
+  std::uint64_t write_attempts_ = 0;
+  mutable std::mutex io_gate_;
+  mutable std::atomic<bool> entered_io_{false};
+  std::atomic<bool> io_blocked_{false};
   std::string port_, calib_;
   int baud_ = 0;
-  std::uint64_t clock_ns_ = kInitialClockNs;
+  mutable std::uint64_t clock_ns_ = kInitialClockNs;  // re-stamped in wall-clock mode
   std::uint64_t step_count_ = 0;
   std::uint64_t stop_count_ = 0;
   std::uint64_t clear_count_ = 0;

@@ -92,6 +92,7 @@ ControlService::ControlService(ArmBackendPtr backend, ControlServiceConfig confi
     config_.limits = backend_->limits();
   }
   if (backend_) {
+    is_real_hardware_ = backend_->isRealHardware();
     backend_->setMotionArmed(false, control_);  // fail-closed
   }
 }
@@ -99,38 +100,56 @@ ControlService::ControlService(ArmBackendPtr backend, ControlServiceConfig confi
 ControlService::~ControlService() { stop(); }
 
 bool ControlService::connect(std::string* error) {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!backend_) {
-    if (error) {
-      *error = "no backend";
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (!backend_) {
+      if (error) {
+        *error = "no backend";
+      }
+      return false;
     }
-    return false;
+    if (state_ != ServiceState::kUnconnected) {
+      return true;
+    }
   }
-  if (state_ != ServiceState::kUnconnected) {
-    return true;
-  }
-  backend_->setMotionArmed(false, control_);
+
+  // Transport work runs under io_mutex_ only; a port that hangs on open must
+  // not freeze the state lock.
   std::string err;
-  if (!backend_->connect(&err)) {
-    if (error) {
-      *error = err;
-    }
-    return false;
-  }
   std::string calib_detail;
-  const bool calib_ok = backend_->hasValidCalibration(&calib_detail);
-  calibration_ok_ = calib_ok;
-  if (backend_->isRealHardware() && config_.safety.require_calibration &&
-      !calib_ok) {
-    backend_->disconnect();
+  bool calib_ok = false;
+  bool refused_calib = false;
+  RobotState observed{};
+  {
+    std::lock_guard<std::mutex> io(io_mutex_);
+    backend_->setMotionArmed(false, control_);
+    if (!backend_->connect(&err)) {
+      if (error) {
+        *error = err;
+      }
+      return false;
+    }
+    calib_ok = backend_->hasValidCalibration(&calib_detail);
+    if (is_real_hardware_ && config_.safety.require_calibration && !calib_ok) {
+      backend_->disconnect();
+      refused_calib = true;
+    } else {
+      observed = backend_->readState();
+    }
+  }
+
+  if (refused_calib) {
     if (error) {
       *error = "refused: real hardware without a valid calibration (" +
                calib_detail + ")";
     }
     return false;
   }
+
+  std::lock_guard<std::mutex> lk(mutex_);
+  calibration_ok_ = calib_ok;
   state_ = ServiceState::kStandby;
-  latest_state_ = backend_->readState();
+  latest_state_ = observed;
   return true;
 }
 
@@ -163,41 +182,65 @@ void ControlService::stop() {
   if (worker_.joinable()) {
     worker_.join();
   }
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (state_ == ServiceState::kUnconnected) {
+  bool was_connected = false;
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    was_connected = state_ != ServiceState::kUnconnected;
+    motion_enabled_ = false;
+    state_ = ServiceState::kStandby;
+  }
+  if (!was_connected) {
     return;
   }
-  motion_enabled_ = false;
+  std::lock_guard<std::mutex> io(io_mutex_);
   backend_->setMotionArmed(false, control_);
   backend_->stop();
-  state_ = ServiceState::kStandby;
 }
 
 EnableResult ControlService::enableMotion(bool human_confirmed) {
-  std::lock_guard<std::mutex> lock(mutex_);
   EnableResult r;
-  if (!backend_ || state_ == ServiceState::kUnconnected) {
-    r.error = "refused: not connected";
-    return r;
+
+  // 1) Control-plane checks: no backend call in this section.
+  {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (!backend_ || state_ == ServiceState::kUnconnected) {
+      r.error = "refused: not connected";
+      return r;
+    }
+    if (fault_latched_) {
+      r.error = "refused: a fault is latched; clear it before enabling motion";
+      return r;
+    }
+    if (!human_confirmed) {
+      r.error =
+          "refused: enabling motion requires an explicit human confirmation";
+      return r;
+    }
+    if (is_real_hardware_ && !config_.safety.allow_real_hardware) {
+      r.error = "refused: real hardware motion requires allow_real_hardware";
+      return r;
+    }
   }
-  if (fault_latched_) {
-    r.error = "refused: a fault is latched; clear it before enabling motion";
-    return r;
-  }
-  if (!human_confirmed) {
-    r.error = "refused: enabling motion requires an explicit human confirmation";
-    return r;
-  }
-  if (backend_->isRealHardware() && !config_.safety.allow_real_hardware) {
-    r.error = "refused: real hardware motion requires allow_real_hardware";
-    return r;
-  }
-  latest_state_ = backend_->readState();
+
+  // 2) Observation.  A transport that hangs here cannot take mutex_ down with
+  //    it, so polling and stop requests stay responsive throughout.
+  RobotState observed{};
   std::string calib_detail;
-  const bool calib_ok = backend_->hasValidCalibration(&calib_detail);
+  bool calib_ok = false;
+  {
+    std::lock_guard<std::mutex> io(io_mutex_);
+    observed = backend_->readState();
+    calib_ok = backend_->hasValidCalibration(&calib_detail);
+  }
+
+  // 3) Validate, publish, and arm.  Arming is a gate operation rather than a
+  //    bus write; it stays next to the state change so the periodic thread can
+  //    never observe "enabled but disarmed" and fault spuriously.
+  std::lock_guard<std::mutex> lk(mutex_);
   calibration_ok_ = calib_ok;
+  latest_state_ = observed;
   const SafetyReport report =
-      monitor_.checkMotionEnable(latest_state_, now(), calib_ok);
+      monitor_.checkMotionEnable(observed, now(), calib_ok);
   if (!report.ok()) {
     r.error = "refused: motion enable failed safety checks: " + report.toString();
     return r;
@@ -214,10 +257,13 @@ EnableResult ControlService::enableMotion(bool human_confirmed) {
 
 void ControlService::disableMotion() {
   std::lock_guard<std::mutex> lock(mutex_);
+  std::lock_guard<std::mutex> lk(mutex_);
   motion_enabled_ = false;
   has_pending_cmd_ = false;
   traj_.clear();
   if (backend_ && state_ != ServiceState::kUnconnected) {
+    // Gate + mode-0 are cheap control-plane writes kept adjacent to the state
+    // change; the blocking transport calls live in runCycle's io sections.
     backend_->setMotionArmed(false, control_);
     backend_->stop();
     if (!fault_latched_) {
@@ -572,10 +618,6 @@ bool ControlService::confirmMotorDisable(std::string* error) {
   return true;
 }
 
-void ControlService::sendToBackendLocked(const ArmCommand& cmd) {
-  backend_->writeCommand(cmd);
-}
-
 JointVector ControlService::rampLocked(const JointVector& target) {
   JointVector out;
   const double step = config_.safety.max_joint_step_rad;
@@ -596,182 +638,319 @@ bool ControlService::trajectoryDoneLocked(std::uint64_t t) const {
 }
 
 void ControlService::runCycle() {
-  std::lock_guard<std::mutex> lock(mutex_);
-  if (!backend_ || state_ == ServiceState::kUnconnected) {
-    return;
-  }
-  const std::uint64_t t = [&] {
-    // Refresh feedback FIRST, then take the reference time, so a backend that
-    // stamps its state with its own clock reading (taken moments before `t`)
-    // can never appear "in the future" relative to the safety check.
-    latest_state_ = backend_->readState();
-    return now();
-  }();
-  ++ticks_;
+  const auto exec_start = std::chrono::steady_clock::now();
 
-  // 1) Controlled-stop sequencing.  Runs for a stop reached via a latched fault
-  //    OR an explicit requestControlledStop(), independent of the watchdog.
-  //
-  //    The stop holds under ACTIVE FOC and stays there.  Nothing in this branch
-  //    removes the drive: zero velocity plus an elapsed timer is not proof that
-  //    de-energising is safe, and lost feedback is even less so.  Only the
-  //    operator's confirmMotorDisable() may cross into kMotorDisabled.
-  if (state_ == ServiceState::kControlledStop) {
-    const bool trusted = feedbackTrustedLocked(t);
-    bool still_now = trusted;
-    if (still_now) {
-      for (int i = 0; i < kNumJoints; ++i) {
-        if (std::fabs(latest_state_.dq[static_cast<std::size_t>(i)]) >
-            config_.stop_vel_tol) {
-          still_now = false;
+  // -- Phase A: observe.  The state lock is deliberately NOT held across a
+  // backend call: with the pybind bridge that call is Python, and a callback
+  // that never returns must not take the control plane down with it.
+  RobotState observed{};
+  bool backend_armed = false;
+  {
+    std::lock_guard<std::mutex> io(io_mutex_);
+    if (!backend_) {
+      return;
+    }
+    observed = backend_->readState();
+    backend_armed = backend_->motionArmed();
+  }
+  // Timestamp AFTER the read so a backend that stamps from its own clock cannot
+  // appear to be in the future relative to the freshness check.
+  const std::uint64_t t = now();
+
+  // Staged backend actions, executed in phase C with the state lock released.
+  enum Action : unsigned {
+    kActNone = 0,
+    kActDisarm = 1u << 0,
+    kActStopMotors = 1u << 1,
+  };
+  unsigned actions = kActNone;
+  bool have_send = false;
+  ArmCommand to_send{};
+
+  // -- Phase B: decide.  mutex_ only, never across I/O.  Wrapped in an
+  // immediately-invoked lambda so that an early exit from the decision still
+  // falls through to phase C, where the staged frame is actually sent.
+  bool abort_cycle = false;
+  [&]() {
+    std::lock_guard<std::mutex> lk(mutex_);
+    if (!backend_ || state_ == ServiceState::kUnconnected) {
+      abort_cycle = true;
+      return;
+    }
+    latest_state_ = observed;
+    ++ticks_;
+
+    // Loop instrumentation.  Lateness is judged on the service clock so that
+    // virtual-clock tests and the real thread measure the same thing.
+    const std::uint64_t tol =
+        config_.overrun_tolerance_ns != 0
+            ? config_.overrun_tolerance_ns
+            : config_.period_ns / 2ULL;
+    if (last_cycle_ns_ != 0) {
+      const std::uint64_t interval = (t >= last_cycle_ns_) ? (t - last_cycle_ns_) : 0;
+      const std::uint64_t jitter =
+          interval > config_.period_ns ? interval - config_.period_ns
+                                       : config_.period_ns - interval;
+      if (jitter > metrics_.max_jitter_ns) {
+        metrics_.max_jitter_ns = jitter;
+      }
+      if (interval > config_.period_ns + tol) {
+        ++metrics_.overruns;
+        ++metrics_.consecutive_overruns;
+      } else {
+        metrics_.consecutive_overruns = 0;
+      }
+    }
+    last_cycle_ns_ = t;
+    ++metrics_.cycles;
+    metrics_.period_ns = config_.period_ns;
+    // Wall-clock span for the reported rate.  Deliberately steady_clock and not
+    // the (possibly virtual) service clock: the rate is a hardware observation.
+    const std::uint64_t wall = nowNs();
+    if (first_cycle_wall_ns_ == 0) {
+      first_cycle_wall_ns_ = wall;
+    }
+    last_cycle_wall_ns_ = wall;
+
+    // 1) Controlled stop: hold under active FOC, indefinitely.  Nothing here
+    //    removes the drive; see confirmMotorDisable().
+    if (state_ == ServiceState::kControlledStop) {
+      const bool trusted = feedbackTrustedLocked(t);
+      bool still_now = trusted;
+      if (still_now) {
+        for (int i = 0; i < kNumJoints; ++i) {
+          if (std::fabs(latest_state_.dq[static_cast<std::size_t>(i)]) >
+              config_.stop_vel_tol) {
+            still_now = false;
+            break;
+          }
+        }
+      }
+      if (still_now) {
+        if (stop_still_since_ns_ == 0) {
+          stop_still_since_ns_ = t;
+        }
+        if ((t - stop_still_since_ns_) >= config_.stop_settle_ns) {
+          stop_verified_ = true;
+        }
+      } else {
+        stop_still_since_ns_ = 0;
+        stop_verified_ = false;
+      }
+
+      to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                     config_.hold_kd);
+      have_send = true;
+      return;  // phase C still runs: the staged hold frame must be sent
+    }
+    if (state_ == ServiceState::kMotorDisabled) {
+      abort_cycle = true;
+      return;  // terminal until an operator clears the fault and re-enables
+    }
+
+    // 2) A latched fault not yet in the controlled stop routes into it.
+    if (fault_latched_) {
+      beginControlledStopLocked(stopReasonForFault(last_fault_code_));
+      to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                     config_.hold_kd);
+      have_send = true;
+      return;
+    }
+
+    // 3) A control loop that is persistently late is itself unhealthy: the
+    //    arm is being commanded at an unknown rate.
+    if (config_.max_consecutive_overruns != 0 &&
+        stateIsMotionActive(state_) &&
+        metrics_.consecutive_overruns >= config_.max_consecutive_overruns) {
+      latchFaultLocked("ctrl.deadline_missed");
+      beginControlledStopLocked(StopReason::kUnsafeState);
+      to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                     config_.hold_kd);
+      have_send = true;
+      return;
+    }
+
+    // 4) Motion enabled: upper-layer watchdog + feedback safety.
+    if (motion_enabled_) {
+      const bool upper_alive =
+          (t - last_upper_contact_ns_) <= config_.command_timeout_ns;
+      if (!upper_alive) {
+        latchFaultLocked("comm.watchdog_timeout");
+        beginControlledStopLocked(StopReason::kUpperLayerTimeout);
+        to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                       config_.hold_kd);
+        have_send = true;
+        return;
+      }
+      if (!latest_state_.connected) {
+        latchFaultLocked("state.not_connected");
+        beginControlledStopLocked(StopReason::kFeedbackLost);
+        to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                       config_.hold_kd);
+        have_send = true;
+        return;
+      }
+      const SafetyReport rep = monitor_.checkState(latest_state_, t);
+      if (!rep.ok()) {
+        const std::string code =
+            rep.faultCodes().empty() ? std::string("state.unsafe")
+                                     : rep.faultCodes().front();
+        latchFaultLocked(code);
+        beginControlledStopLocked(stopReasonForFault(code));
+        to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                       config_.hold_kd);
+        have_send = true;
+        return;
+      }
+    } else {
+      if (is_real_hardware_ && backend_armed) {
+        actions |= kActDisarm;  // safety net: never armed while idle
+      }
+      state_ = ServiceState::kStandby;
+      abort_cycle = true;
+      return;  // standby sends no control frames at all
+    }
+
+    // 5) Motion enabled, upper layer alive, state healthy: command the setpoint.
+    ArmCommand target_cmd;
+    if (!traj_.empty()) {
+      const std::uint64_t rel = t - traj_upload_ns_;
+      std::size_t seg = traj_.size() - 2;
+      for (std::size_t i = 0; i + 1 < traj_.size(); ++i) {
+        if (rel < traj_[i + 1].t_ns) {
+          seg = i;
           break;
         }
       }
-    }
-    if (still_now) {
-      if (stop_still_since_ns_ == 0) {
-        stop_still_since_ns_ = t;
+      const TrajWaypoint& a = traj_[seg];
+      const TrajWaypoint& b = traj_[seg + 1];
+      double tau = 1.0;
+      if (b.t_ns > a.t_ns) {
+        tau = static_cast<double>(rel - a.t_ns) /
+              static_cast<double>(b.t_ns - a.t_ns);
       }
-      if ((t - stop_still_since_ns_) >= config_.stop_settle_ns) {
-        stop_verified_ = true;  // settle window observed without a break
+      if (tau < 0.0) tau = 0.0;
+      if (tau > 1.0) tau = 1.0;
+      const double s = minJerkS(tau);
+      JointVector interp{};
+      for (int j = 0; j < kNumJoints; ++j) {
+        const std::size_t sj = static_cast<std::size_t>(j);
+        interp[sj] = a.q[sj] + (b.q[sj] - a.q[sj]) * s;
       }
+      if (trajectoryDoneLocked(t)) {
+        traj_.clear();
+      }
+      target_cmd = ArmCommand::position(interp, config_.hold_kp, config_.hold_kd);
+    } else if (has_pending_cmd_) {
+      target_cmd = pending_cmd_;
     } else {
-      // Lost feedback, or a joint moving: the settle run restarts and any prior
-      // verification is withdrawn.  We deliberately do NOT keep a stale
-      // "verified" flag, because that would let an operator drop the drive on
-      // evidence from a moment we can no longer see.
-      stop_still_since_ns_ = 0;
-      stop_verified_ = false;
-    }
-
-    ArmCommand hold =
-        ArmCommand::position(stop_target_, config_.hold_kp, config_.hold_kd);
-    sendToBackendLocked(hold);
-    return;
-  }
-  if (state_ == ServiceState::kMotorDisabled) {
-    return;  // terminal until an operator clears the fault and re-enables
-  }
-
-  // 2) A latched fault that is not yet in the controlled stop routes into it on
-  //    the next tick.  It can never leave this state on its own.
-  if (fault_latched_) {
-    beginControlledStopLocked(stopReasonForFault(last_fault_code_));
-    return;
-  }
-
-  // 3) Motion enabled: upper-layer watchdog + feedback safety.
-  if (motion_enabled_) {
-    const bool upper_alive = (t - last_upper_contact_ns_) <= config_.command_timeout_ns;
-    if (!upper_alive) {
-      latchFaultLocked("comm.watchdog_timeout");
-      beginControlledStopLocked(StopReason::kUpperLayerTimeout);
-      return;
-    }
-    if (!latest_state_.connected) {
-      latchFaultLocked("state.not_connected");
-      beginControlledStopLocked(StopReason::kFeedbackLost);
-      return;
-    }
-    const SafetyReport rep = monitor_.checkState(latest_state_, t);
-    if (!rep.ok()) {
-      const std::string code =
-          rep.faultCodes().empty() ? std::string("state.unsafe")
-                                   : rep.faultCodes().front();
-      latchFaultLocked(code);
-      beginControlledStopLocked(stopReasonForFault(code));
-      return;
-    }
-  } else {
-    if (backend_->isRealHardware() && backend_->motionArmed()) {
-      backend_->setMotionArmed(false, control_);  // safety net: never armed idle
-    }
-    state_ = ServiceState::kStandby;
-    return;
-  }
-
-  // 4) Motion enabled, upper layer alive, state healthy: command the setpoint.
-  ArmCommand target_cmd;
-  if (!traj_.empty()) {
-    const std::uint64_t rel = t - traj_upload_ns_;
-    std::size_t seg = traj_.size() - 2;
-    for (std::size_t i = 0; i + 1 < traj_.size(); ++i) {
-      if (rel < traj_[i + 1].t_ns) {
-        seg = i;
-        break;
-      }
-    }
-    const TrajWaypoint& a = traj_[seg];
-    const TrajWaypoint& b = traj_[seg + 1];
-    double tau = 1.0;
-    if (b.t_ns > a.t_ns) {
-      tau = static_cast<double>(rel - a.t_ns) / static_cast<double>(b.t_ns - a.t_ns);
-    }
-    if (tau < 0.0) tau = 0.0;
-    if (tau > 1.0) tau = 1.0;
-    const double s = minJerkS(tau);
-    JointVector interp{};
-    for (int j = 0; j < kNumJoints; ++j) {
-      const std::size_t sj = static_cast<std::size_t>(j);
-      interp[sj] = a.q[sj] + (b.q[sj] - a.q[sj]) * s;
-    }
-    if (trajectoryDoneLocked(t)) {
-      traj_.clear();
-    }
-    target_cmd = ArmCommand::position(interp, config_.hold_kp, config_.hold_kd);
-  } else if (has_pending_cmd_) {
-    target_cmd = pending_cmd_;
-  } else {
-    target_cmd = ArmCommand::position(latest_state_.q, config_.hold_kp,
-                                      config_.hold_kd);
-    state_ = ServiceState::kSoftwareHold;
-  }
-
-  // Ramp the commanded position so it never steps more than
-  // max_joint_step_rad from the last commanded target (anti-jump smoothing).
-  JointVector target_q{};
-  for (int i = 0; i < kNumJoints; ++i) {
-    const std::size_t si = static_cast<std::size_t>(i);
-    target_q[si] = target_cmd.joints[si].q;
-  }
-  const JointVector ramped = rampLocked(target_q);
-  ArmCommand to_send = target_cmd;
-  for (int i = 0; i < kNumJoints; ++i) {
-    const std::size_t si = static_cast<std::size_t>(i);
-    to_send.joints[si].q = ramped[si];
-  }
-  last_target_ = ramped;
-  has_last_target_ = true;
-
-  if (to_send.hasActuation()) {
-    const SafetyReport cmd_rep = monitor_.checkCommand(
-        to_send, latest_state_, config_.limits, t, calibration_ok_);
-    if (!cmd_rep.ok()) {
-      const std::string code = cmd_rep.faultCodes().empty()
-                                   ? std::string("cmd.unsafe")
-                                   : cmd_rep.faultCodes().front();
-      latchFaultLocked(code);
-      beginControlledStopLocked(stopReasonForFault(code));
-      return;
-    }
-    if (backend_->isRealHardware() && !backend_->motionArmed()) {
-      latchFaultLocked("internal.disarmed_while_enabled");
-      beginControlledStopLocked(StopReason::kUnsafeState);
-      return;
-    }
-    if (state_ != ServiceState::kTrackingTrajectory) {
+      target_cmd = ArmCommand::position(latest_state_.q, config_.hold_kp,
+                                        config_.hold_kd);
       state_ = ServiceState::kSoftwareHold;
     }
+
+    JointVector target_q{};
+    for (int i = 0; i < kNumJoints; ++i) {
+      const std::size_t si = static_cast<std::size_t>(i);
+      target_q[si] = target_cmd.joints[si].q;
+    }
+    const JointVector ramped = rampLocked(target_q);
+    ArmCommand frame = target_cmd;
+    for (int i = 0; i < kNumJoints; ++i) {
+      const std::size_t si = static_cast<std::size_t>(i);
+      frame.joints[si].q = ramped[si];
+    }
+    last_target_ = ramped;
+    has_last_target_ = true;
+
+    if (frame.hasActuation()) {
+      const SafetyReport cmd_rep = monitor_.checkCommand(
+          frame, latest_state_, config_.limits, t, calibration_ok_);
+      if (!cmd_rep.ok()) {
+        const std::string code =
+            cmd_rep.faultCodes().empty() ? std::string("cmd.unsafe")
+                                         : cmd_rep.faultCodes().front();
+        latchFaultLocked(code);
+        beginControlledStopLocked(stopReasonForFault(code));
+        to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                       config_.hold_kd);
+        have_send = true;
+        return;
+      }
+      if (is_real_hardware_ && !backend_armed) {
+        latchFaultLocked("internal.disarmed_while_enabled");
+        beginControlledStopLocked(StopReason::kUnsafeState);
+        to_send = ArmCommand::position(stop_target_, config_.hold_kp,
+                                       config_.hold_kd);
+        have_send = true;
+        return;
+      }
+      if (state_ != ServiceState::kTrackingTrajectory) {
+        state_ = ServiceState::kSoftwareHold;
+      }
+    }
+    to_send = frame;
+    have_send = true;
+  }();
+
+  if (abort_cycle) {
+    return;
   }
 
-  sendToBackendLocked(to_send);
+  // -- Phase C: act on the backend, with the state lock released.
+  bool send_failed = false;
+  {
+    std::lock_guard<std::mutex> io(io_mutex_);
+    if (!backend_) {
+      return;
+    }
+    if (actions & kActDisarm) {
+      backend_->setMotionArmed(false, control_);
+    }
+    if (have_send) {
+      send_failed = !backend_->writeCommand(to_send);
+    }
+  }
+
+  if (send_failed) {
+    std::lock_guard<std::mutex> lk(mutex_);
+    ++metrics_.send_failures;
+    if (!fault_latched_) {
+      // The frame never reached the arm.  Continuing as though it had would
+      // leave the service commanding an output it cannot observe.
+      latchFaultLocked("bus.send_failed");
+      beginControlledStopLocked(StopReason::kUnsafeState);
+    }
+  }
+
+  const auto exec_ns = static_cast<std::uint64_t>(
+      std::chrono::duration_cast<std::chrono::nanoseconds>(
+          std::chrono::steady_clock::now() - exec_start)
+          .count());
+  std::lock_guard<std::mutex> lk(mutex_);
+  metrics_.total_exec_ns += exec_ns;
+  if (exec_ns > metrics_.max_exec_ns) {
+    metrics_.max_exec_ns = exec_ns;
+  }
 }
 
 void ControlService::threadMain() {
-  auto period = std::chrono::nanoseconds(config_.period_ns);
+  // Absolute-deadline scheduling.  Sleeping a fixed period AFTER the work made
+  // the interval "period + work", which drifts with load and silently lowers the
+  // control rate.  Deadlines are advanced independently of when they are
+  // reached, and a missed deadline rebases instead of firing a catch-up burst
+  // (a burst of stale setpoints is worse than one late frame).
+  const auto period = std::chrono::nanoseconds(config_.period_ns);
+  auto deadline = std::chrono::steady_clock::now() + period;
   while (running_.load()) {
     runCycle();
-    std::this_thread::sleep_for(period);
+    deadline += period;
+    const auto now_tp = std::chrono::steady_clock::now();
+    if (now_tp >= deadline) {
+      deadline = now_tp + period;
+    } else {
+      std::this_thread::sleep_until(deadline);
+    }
   }
 }
 
@@ -806,6 +985,19 @@ bool ControlService::stopHoldVerified() const {
 RobotState ControlService::latestState() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return latest_state_;
+}
+
+ControlLoopMetrics ControlService::metrics() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  ControlLoopMetrics m = metrics_;
+  if (m.cycles > 1 && last_cycle_wall_ns_ > first_cycle_wall_ns_) {
+    const double span_s =
+        static_cast<double>(last_cycle_wall_ns_ - first_cycle_wall_ns_) * 1e-9;
+    if (span_s > 0.0) {
+      m.measured_rate_hz = static_cast<double>(m.cycles - 1) / span_s;
+    }
+  }
+  return m;
 }
 
 bool ControlService::faultLatched() const {

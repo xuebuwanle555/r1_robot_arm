@@ -121,6 +121,13 @@ struct ControlServiceConfig {
   /// than this is refused rather than silently crept toward.
   std::uint64_t traj_lead_in_max_ns = 5ULL * 1000ULL * 1000ULL * 1000ULL;
 
+  /// A cycle is "late" when the interval since the previous one exceeds
+  /// period + tolerance.  0 means half the period.
+  std::uint64_t overrun_tolerance_ns = 0;
+  /// Consecutive late cycles before the loop itself is declared unhealthy.
+  /// 0 disables latching on lateness (measurement only).
+  std::uint64_t max_consecutive_overruns = 5;
+
   /// Monotonic clock source.  Defaults to r1_robot::nowNs().  Tests inject a
   /// virtual clock (shared with the mock backend) to drive the watchdog and
   /// trajectory timing deterministically with no sleeps.
@@ -174,6 +181,24 @@ struct ServiceStatus {
   std::string last_fault_code;
   std::uint64_t ticks = 0;
   std::uint64_t last_upper_contact_ns = 0;
+};
+
+/// Measured behaviour of the control loop.
+///
+/// These are observations, not guarantees.  The loop is a `std::thread` on a
+/// general-purpose kernel: nothing here establishes hard real-time behaviour,
+/// and the achievable rate, jitter and feedback latency on a real R1 remain
+/// `HARDWARE_UNVERIFIED` until measured per HARDWARE_BRINGUP.md.
+struct ControlLoopMetrics {
+  std::uint64_t cycles = 0;               ///< runCycle() invocations
+  std::uint64_t period_ns = 0;            ///< configured target period
+  std::uint64_t overruns = 0;             ///< late cycle starts
+  std::uint64_t consecutive_overruns = 0; ///< late cycles since the last on-time one
+  std::uint64_t send_failures = 0;        ///< writeCommand() returned false
+  std::uint64_t total_exec_ns = 0;        ///< wall time spent inside the loop
+  std::uint64_t max_exec_ns = 0;
+  std::uint64_t max_jitter_ns = 0;        ///< worst |actual interval - period|
+  double measured_rate_hz = 0.0;          ///< cycles / wall-clock span
 };
 
 class ControlService {
@@ -235,6 +260,7 @@ class ControlService {
   RobotState latestState() const;
   bool faultLatched() const;
   std::string lastFaultCode() const;
+  ControlLoopMetrics metrics() const;
 
  private:
   std::uint64_t now() const { return clock_ ? clock_() : nowNs(); }
@@ -242,7 +268,6 @@ class ControlService {
   // Assumes mutex_ held.
   void latchFaultLocked(const std::string& code);
   void beginControlledStopLocked(StopReason reason);
-  void sendToBackendLocked(const ArmCommand& cmd);
   JointVector rampLocked(const JointVector& target);
   bool trajectoryDoneLocked(std::uint64_t t) const;
   /// Feedback we would be willing to base a decision on: connected, every joint
@@ -261,7 +286,16 @@ class ControlService {
   MotionControl control_;  // ControlService is a friend of MotionControl.
   std::function<std::uint64_t()> clock_;
 
+  // LOCK DISCIPLINE.  `mutex_` guards service state only and is NEVER held
+  // across a backend call; `io_mutex_` serialises backend calls.  A runCycle()
+  // therefore observes (io_mutex_), decides (mutex_) and acts (io_mutex_) in
+  // three separate sections.  This exists because a backend may be an external
+  // callback - the pybind bridge runs Python - and a callback that never
+  // returns must not be able to freeze status polling or a stop request.
+  // The two locks are never held simultaneously, so there is no lock order to
+  // get wrong.
   mutable std::mutex mutex_;
+  std::mutex io_mutex_;
   std::thread worker_;
   std::atomic<bool> running_{false};
 
@@ -294,6 +328,13 @@ class ControlService {
   bool has_last_target_ = false;
 
   bool calibration_ok_ = false;
+  bool is_real_hardware_ = false;
+
+  // Control-loop instrumentation (guarded by mutex_).
+  ControlLoopMetrics metrics_{};
+  std::uint64_t last_cycle_ns_ = 0;       ///< service-clock time of the last cycle
+  std::uint64_t first_cycle_wall_ns_ = 0;  ///< nowNs() at the first cycle
+  std::uint64_t last_cycle_wall_ns_ = 0;
 };
 
 }  // namespace r1_robot

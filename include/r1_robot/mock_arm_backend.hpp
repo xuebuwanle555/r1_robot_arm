@@ -119,6 +119,9 @@ class MockArmBackend final : public IArmBackend {
     if (!gate_.allows(cmd)) {  // Refuse actuation while disarmed (bypass guard).
       return false;
     }
+    if (bus_->failWrite()) {  // wedged transport: the frame never reaches the arm
+      return false;
+    }
     std::array<JointBusCommand, kNumJoints> translated{};
     for (int i = 0; i < kNumJoints; ++i) {
       const std::size_t si = static_cast<std::size_t>(i);

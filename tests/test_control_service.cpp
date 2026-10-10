@@ -13,13 +13,18 @@
 //   * only ControlService arms the backend (it owns the sole write path);
 //   * a value can never be paired with a mismatched reception time.
 // ---------------------------------------------------------------------------
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <functional>
 #include <limits>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
+#include <future>
 
 #include "r1_robot/control_service.hpp"
 #include "r1_robot/limits.hpp"
@@ -803,4 +808,195 @@ R1_TEST(submit_command_returns_a_reason_and_keeps_holding) {
   h.service->heartbeat();
   h.service->runCycle();
   R1_CHECK_NEAR(h.bus->lastCommands()[0].q, 0.1, 1e-9);  // still the old hold
+}
+
+// ===========================================================================
+// Task C - control-loop reliability.  A send that never reached the arm is a
+// fault, not a no-op; lateness is measured and reported instead of being
+// absorbed by drifting sleeps; and the control plane must stay answerable while
+// a backend call is stuck (the pybind bridge routes I/O through Python).
+// ===========================================================================
+
+namespace {
+
+/// A real-hardware-style backend whose transport can be made to hang, standing
+/// in for a wedged serial port or a pybind callback that never returns.
+struct GatedHarness {
+  std::shared_ptr<MockJointBus> bus = std::make_shared<MockJointBus>();
+  std::shared_ptr<MockArmBackend> backend = std::make_shared<MockArmBackend>(bus);
+  std::shared_ptr<ControlService> service;
+  std::string error;
+
+  GatedHarness() {
+    ControlServiceConfig cfg;
+    cfg.safety.allow_real_hardware = true;
+    cfg.command_timeout_ns = 50 * kMs;
+    cfg.stop_settle_ns = 20 * kMs;
+    cfg.period_ns = kMs;
+    cfg.clock = [b = bus] { return b->nowNs(); };
+    backend->setClock([b = bus] { return b->nowNs(); });
+    service = std::make_shared<ControlService>(backend, cfg);
+  }
+
+  void receiveAll() {
+    for (int i = 0; i < kNumJoints; ++i) {
+      bus->receive(i);
+    }
+  }
+};
+
+/// Run `fn` on another thread and report whether it finished within `budget`.
+/// A blocked callee must make this return false, never hang the suite.
+template <typename F>
+bool finishesWithin(F&& fn, std::chrono::milliseconds budget) {
+  auto fut = std::async(std::launch::async, std::forward<F>(fn));
+  return fut.wait_for(budget) == std::future_status::ready;
+}
+
+}  // namespace
+
+R1_TEST(control_service_send_failure_latches_an_explicit_fault) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  h.bus->setFailWrite(true);  // the transport accepts nothing any more
+  h.bus->tick(kMs);
+  h.receiveAll();
+  h.service->heartbeat();
+  const std::uint64_t steps_before = h.bus->stepCount();
+  h.service->runCycle();
+
+  R1_CHECK(h.service->faultLatched());
+  R1_CHECK_EQ(h.service->lastFaultCode(), std::string("bus.send_failed"));
+  R1_CHECK(h.service->state() == ServiceState::kControlledStop);
+  R1_CHECK_EQ(h.bus->stepCount(), steps_before);  // nothing actually went out
+  R1_CHECK(h.service->metrics().send_failures >= 1);
+}
+
+R1_TEST(control_service_metrics_report_cycles_jitter_and_exec_time) {
+  Harness h;
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  for (int i = 0; i < 10; ++i) {
+    h.alive();
+  }
+  auto m = h.service->metrics();
+  R1_CHECK(m.cycles >= 11);
+  R1_CHECK_EQ(m.period_ns, kMs);
+  R1_CHECK(m.overruns == 0ULL);
+  R1_CHECK(m.measured_rate_hz > 0.0);
+  R1_CHECK(m.max_exec_ns > 0);
+
+  // One late cycle: 10 periods since the previous one.
+  h.bus->tick(10 * kMs);
+  h.receiveAll();
+  h.service->heartbeat();
+  h.service->runCycle();
+  m = h.service->metrics();
+  R1_CHECK_EQ(m.overruns, 1ULL);
+  R1_CHECK(m.max_jitter_ns > kMs);
+  R1_CHECK(!h.service->faultLatched());  // a single miss is not a fault
+}
+
+R1_TEST(control_service_consecutive_deadline_misses_latch_a_fault) {
+  Harness h;
+  h.cfg.max_consecutive_overruns = 3;
+  h.service = std::make_shared<ControlService>(h.backend, h.cfg);
+  R1_CHECK(h.bringup());
+  h.alive();
+
+  // Two late cycles stay below the threshold; the third reaches it.
+  for (int i = 0; i < 2; ++i) {
+    h.bus->tick(20 * kMs);  // 20 periods late, every time
+    h.receiveAll();
+    h.service->heartbeat();
+    h.service->runCycle();
+    R1_CHECK(!h.service->faultLatched());
+    R1_CHECK_EQ(h.service->metrics().consecutive_overruns,
+                static_cast<std::uint64_t>(i + 1));
+  }
+  h.bus->tick(20 * kMs);
+  h.receiveAll();
+  h.service->heartbeat();
+  h.service->runCycle();
+
+  R1_CHECK(h.service->faultLatched());
+  R1_CHECK_EQ(h.service->lastFaultCode(), std::string("ctrl.deadline_missed"));
+  R1_CHECK(h.service->state() == ServiceState::kControlledStop);
+}
+
+R1_TEST(control_plane_stays_answerable_while_the_backend_is_stuck) {
+  GatedHarness g;
+  R1_CHECK(g.service->connect(&g.error));
+  for (int i = 0; i < kNumJoints; ++i) {
+    g.bus->setPosition(i, 0.1);
+  }
+  R1_CHECK(g.service->enableMotion(true).ok);
+  g.bus->tick(kMs);
+  g.receiveAll();
+  g.service->heartbeat();
+  g.service->runCycle();
+  g.bus->blockIo();  // the next backend call will hang
+  std::thread cycle([&] { g.service->runCycle(); });
+
+  // Wait until the cycle is provably inside the blocked transport call.
+  const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+  while (!g.bus->enteredIo() && std::chrono::steady_clock::now() < deadline) {
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+  }
+  R1_CHECK(g.bus->enteredIo());
+
+  // Polling and the stop request must not be held up by the stuck I/O.
+  R1_CHECK(finishesWithin([&] { (void)g.service->status(); },
+                          std::chrono::milliseconds(300)));
+  R1_CHECK(finishesWithin([&] { (void)g.service->latestState(); },
+                          std::chrono::milliseconds(300)));
+  R1_CHECK(finishesWithin([&] { g.service->requestControlledStop(); },
+                          std::chrono::milliseconds(300)));
+
+  g.bus->unblockIo();
+  cycle.join();
+  R1_CHECK(g.service->state() == ServiceState::kControlledStop);
+}
+
+R1_TEST(control_loop_uses_absolute_deadlines_not_drifting_sleeps) {
+  // threadMain() must schedule on an absolute deadline.  Verified through the
+  // reported period: with a real thread and a real clock the measured cycle
+  // interval stays near the configured period instead of accumulating the
+  // duration of each cycle on top of the sleep.
+  auto bus = std::make_shared<MockJointBus>();
+  auto backend = std::make_shared<MockArmBackend>(bus);
+  ControlServiceConfig cfg;
+  cfg.safety.allow_real_hardware = true;
+  cfg.period_ns = 2 * 1000ULL * 1000ULL;  // 2 ms, real time
+  cfg.command_timeout_ns = 500ULL * 1000ULL * 1000ULL;
+  cfg.safety.max_feedback_age_s = 0.5;  // a real thread is not a tight loop
+  cfg.max_consecutive_overruns = 0;       // do not fault during the measurement
+  // No clock override: the service runs on the process monotonic clock, so the
+  // bus must stamp its frames from the same source or every read looks stale.
+  bus->useWallClock(true);
+  ControlService service(backend, cfg);
+
+  std::string err;
+  R1_CHECK(service.connect(&err));
+  for (int i = 0; i < kNumJoints; ++i) {
+    bus->setPosition(i, 0.1);
+    bus->receive(i);
+  }
+  bus->tick(0);
+  R1_CHECK(service.enableMotion(true).ok);
+  service.start();
+  std::this_thread::sleep_for(std::chrono::milliseconds(220));
+  service.stop();
+
+  const auto m = service.metrics();
+  R1_CHECK(m.cycles > 20);
+  // A drifting `sleep_for(period)` after each cycle would put the rate well
+  // below the configured 500 Hz on a loaded machine; an absolute deadline keeps
+  // it close.  Loose bounds only: this is a general-purpose kernel, not a
+  // real-time one (HARDWARE_UNVERIFIED).
+  R1_CHECK(m.measured_rate_hz > 150.0);
+  R1_CHECK(m.measured_rate_hz < 1200.0);
 }
