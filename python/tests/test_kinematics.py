@@ -25,6 +25,16 @@ except Exception as _exc:  # pragma: no cover - missing optional dependency
     HAVE_KIN = False
     _KIN_ERROR = _exc
 
+# R1Kinematics imports pinocchio lazily inside __init__, so importing the module
+# above succeeds even without it. Probe the real dependency directly, otherwise
+# the skip guard below never fires and setUpClass raises instead of skipping.
+try:
+    import pinocchio  # noqa: F401
+
+    HAVE_PIN = True
+except Exception:  # pragma: no cover - missing optional dependency
+    HAVE_PIN = False
+
 
 @unittest.skipUnless(HAVE_KIN, "Pinocchio / official URDF not available")
 class TestUrdfFacts(unittest.TestCase):
@@ -73,7 +83,7 @@ class TestUrdfFacts(unittest.TestCase):
         self.assertEqual(len(facts.mesh_files), 8)
 
 
-@unittest.skipUnless(HAVE_KIN, "Pinocchio / official URDF not available")
+@unittest.skipUnless(HAVE_KIN and HAVE_PIN, "Pinocchio / official URDF not available")
 class TestPinocchioKinematics(unittest.TestCase):
     @classmethod
     def setUpClass(cls):

@@ -197,12 +197,12 @@ end-effector   : [0.0455, -0.0439, 0.2419] m
 ## 6. How to run the tests
 
 ```bash
-# C++ (74 tests)
+# C++ (103 cases / 11 ctest suites)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 
-# Python (64 tests; MuJoCo/Pinocchio tests skip if the extras are missing)
+# Python (104 tests; MuJoCo/Pinocchio tests skip if the extras are missing)
 cd python && python -m pytest -q
 ```
 

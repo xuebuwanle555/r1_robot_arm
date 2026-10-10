@@ -19,6 +19,7 @@ import r1_robot as rr  # noqa: E402
 
 try:
     import mujoco  # noqa: F401
+    import pinocchio  # noqa: F401 - probed directly: R1Kinematics imports it lazily
     from r1_robot.kinematics import R1Kinematics
     from r1_robot.sim import (
         SIM_MODEL_PATH,

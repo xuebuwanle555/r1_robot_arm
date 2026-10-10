@@ -224,8 +224,8 @@ are patched in `<build>/sdk_patched` and the official checkout stays clean
 | Suite | Count | Command |
 |---|---|---|
 | C++ | 103 unit cases / 11 ctest suites (SDK build); 94 / 11 without the SDK | `ctest --test-dir build --output-on-failure` |
-| Python | 103 (2 more skip unless the bridge is built) | `cd python && python -m pytest -q` |
-| C++↔sim bridge (opt-in) | +2 (105 total) | build with `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON` |
+| Python | 104 (2 more skip unless the bridge is built) | `cd python && python -m pytest -q` |
+| C++↔sim bridge (opt-in) | +2 (106 total) | build with `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON` |
 
 Python simulation/dynamics tests skip automatically when MuJoCo or Pinocchio is
 not installed. The C++ suite is validated in CI both with the pinned SDK and with
@@ -321,7 +321,7 @@ cmake -S . -B build-mock -DR1_ROBOT_WITH_UNITREE_BACKEND=OFF -DR1_ROBOT_WARNINGS
 cmake --build build-mock && ctest --test-dir build-mock  # 94 cases, all pass
 
 # 3. Python: offline logic always runs; MuJoCo/Pinocchio suites skip when absent.
-cd python && python -m pytest -q                      # 103 passed
+cd python && python -m pytest -q                      # 104 passed
 
 # 4. The two headline demonstrations:
 ./build/tests/r1_robot_tests --filter control_service  # comm-loss -> fault latch -> refuse motion
@@ -395,7 +395,7 @@ See `HARDWARE_BRINGUP.md` §7 for the full checklist. Summary:
 | Feedback values + reception evidence come from one atomic snapshot | `snapshot_atomic_all_joints_share_one_clock`, `snapshot_*` suite |
 | MuJoCo detects a designed collision scenario | `test_environment_mode_detects_a_designed_tabletop_collision`, `test_self_mode_nominal_is_clean_but_a_fold_is_detected` |
 | Opt-in pybind11 bridge: the production C++ `ControlService` drives the real MuJoCo plant and latches a fault on comm loss against the real monotonic clock | `python/tests/test_control_binding.py` (`test_cpp_service_drives_mujoco_then_survives_comm_loss`, requires `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON`) |
-| 103 C++ + 103 Python tests pass (SDK build; 94 C++ without the SDK) | `ctest` / `pytest` |
+| 103 C++ + 104 Python tests pass (SDK build; 94 C++ without the SDK) | `ctest` / `pytest` |
 
 ### To be verified on real hardware (`TODO(bringup)` / 待验证)
 

@@ -13,6 +13,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import r1_robot as rr  # noqa: E402
 
+# Only the static-hold-torque check needs Pinocchio; every other test here is a
+# pure joint-limit check. Probe it directly because R1Kinematics imports it
+# lazily, so an import of the wrapper module would always appear to succeed.
+try:
+    import pinocchio  # noqa: F401
+
+    HAVE_PIN = True
+except Exception:  # pragma: no cover - missing optional dependency
+    HAVE_PIN = False
+
 
 class TestPoseDefinitions(unittest.TestCase):
     def test_kinematic_zero_is_not_commandable(self):
@@ -33,6 +43,7 @@ class TestPoseDefinitions(unittest.TestCase):
         # Strictly more than the bare minimum margin.
         self.assertGreater(rr.min_soft_margin(rr.SAFE_HOME), 0.0)
 
+    @unittest.skipUnless(HAVE_PIN, "Pinocchio not available")
     def test_safe_home_keeps_static_hold_torque_small(self):
         """A home pose should not sit near a torque limit if it fails."""
         self.assertTrue(rr.static_hold_within_torque_limits(rr.SAFE_HOME, 0.5))

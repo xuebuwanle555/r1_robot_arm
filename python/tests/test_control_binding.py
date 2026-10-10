@@ -25,8 +25,16 @@ import numpy as np
 try:
     import r1_robot as rr
     from r1_robot import _control_binding as cb
+
+    # The bridge drives a real SimArm, which needs both optional sim engines at
+    # construction time. Importing the binding alone is not enough: without this
+    # the test fails instead of skipping on a machine that built the .so but has
+    # no MuJoCo / Pinocchio.
+    import mujoco  # noqa: F401
+    import pinocchio  # noqa: F401
+
     HAVE_BRIDGE = True
-except Exception:  # pragma: no cover - binding not built
+except Exception:  # pragma: no cover - binding not built, or sim deps missing
     HAVE_BRIDGE = False
 
 GOAL = np.array([0.2, 0.5, 0.1, 0.4, -0.2, 0.1, 0.2])

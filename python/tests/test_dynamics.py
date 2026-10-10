@@ -333,15 +333,19 @@ class TestControlFrequencyAssumptions(unittest.TestCase):
         # 7 * 115 us = 805 us of enforced delay, before serial time and motor
         # turnaround.  A 500 Hz loop (2 ms period) therefore has less than
         # 1.2 ms for everything else and must be MEASURED on hardware, not
-        # assumed.  This test documents the arithmetic floor.
+        # assumed.  This test documents the arithmetic floor.  It is offline by
+        # design: it must also run where MuJoCo is not installed.
         per_joint_delay_s = 115e-6
         joints = rr.NUM_JOINTS
         frame_floor_s = per_joint_delay_s * joints
         self.assertAlmostEqual(frame_floor_s, 805e-6, places=9)
         max_theoretical_rate_hz = 1.0 / frame_floor_s
         self.assertAlmostEqual(max_theoretical_rate_hz, 1242.2, places=0)
-        # The simulation, by contrast, runs at 500 Hz (2 ms).  They are
-        # different numbers and must not be conflated.
+
+    @unittest.skipUnless(HAVE_DEPS, "MuJoCo / Pinocchio not available")
+    def test_simulation_rate_is_not_the_hardware_rate(self):
+        # The simulation runs at 500 Hz.  It is a different number from the
+        # hardware floor above and the two must not be conflated.
         self.assertEqual(int(round(1.0 / SimArmConfig().timestep)), 500)
 
 
