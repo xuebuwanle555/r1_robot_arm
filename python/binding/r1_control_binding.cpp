@@ -186,7 +186,7 @@ ControlServiceConfig config_from_python(const py::object& c) {
   ControlServiceConfig cfg;
   cfg.period_ns = c.attr("period_ns").cast<std::uint64_t>();
   cfg.command_timeout_ns = c.attr("command_timeout_ns").cast<std::uint64_t>();
-  cfg.stop_hold_ns = c.attr("stop_hold_ns").cast<std::uint64_t>();
+  cfg.stop_settle_ns = c.attr("stop_settle_ns").cast<std::uint64_t>();
   cfg.stop_vel_tol = c.attr("stop_vel_tol").cast<double>();
   cfg.hold_kp = c.attr("hold_kp").cast<double>();
   cfg.hold_kd = c.attr("hold_kd").cast<double>();
@@ -218,11 +218,20 @@ PYBIND11_MODULE(_control_binding, m) {
       .value("MOTOR_DISABLED", ServiceState::kMotorDisabled)
       .export_values();
 
+  py::enum_<StopReason>(m, "StopReason")
+      .value("NONE", StopReason::kNone)
+      .value("OPERATOR_STOP", StopReason::kOperatorStop)
+      .value("UPPER_LAYER_TIMEOUT", StopReason::kUpperLayerTimeout)
+      .value("FEEDBACK_LOST", StopReason::kFeedbackLost)
+      .value("ACTUATOR_FAULT", StopReason::kActuatorFault)
+      .value("UNSAFE_STATE", StopReason::kUnsafeState)
+      .export_values();
+
   py::class_<ControlServiceConfig>(m, "ControlServiceConfig")
       .def(py::init<>())
       .def_readwrite("period_ns", &ControlServiceConfig::period_ns)
       .def_readwrite("command_timeout_ns", &ControlServiceConfig::command_timeout_ns)
-      .def_readwrite("stop_hold_ns", &ControlServiceConfig::stop_hold_ns)
+      .def_readwrite("stop_settle_ns", &ControlServiceConfig::stop_settle_ns)
       .def_readwrite("stop_vel_tol", &ControlServiceConfig::stop_vel_tol)
       .def_readwrite("hold_kp", &ControlServiceConfig::hold_kp)
       .def_readwrite("hold_kd", &ControlServiceConfig::hold_kd)
@@ -268,6 +277,16 @@ PYBIND11_MODULE(_control_binding, m) {
            },
            py::arg("waypoints"))
       .def("request_controlled_stop", &ControlService::requestControlledStop)
+      // Operator-only drive removal.  Exposed as a deliberate call because the
+      // service will never take this step by itself.
+      .def("confirm_motor_disable",
+           [](ControlService& s) {
+             std::string err;
+             bool ok = s.confirmMotorDisable(&err);
+             return std::make_pair(ok, err);
+           })
+      .def("stop_reason", &ControlService::stopReason)
+      .def("stop_hold_verified", &ControlService::stopHoldVerified)
       .def("run_cycle", &ControlService::runCycle)
       .def("clear_fault",
            [](ControlService& s) {

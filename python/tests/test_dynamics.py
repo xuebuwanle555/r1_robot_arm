@@ -349,5 +349,75 @@ class TestControlFrequencyAssumptions(unittest.TestCase):
         self.assertEqual(int(round(1.0 / SimArmConfig().timestep)), 500)
 
 
+@unittest.skipUnless(HAVE_DEPS, "MuJoCo / Pinocchio not available")
+class TestGravityLoadAtDriveRemoval(unittest.TestCase):
+    """Task A, item 6: "the joints are still" is NOT evidence that the arm
+    survives being de-energised.
+
+    The controlled-stop logic used to conclude from `|dq| < tol` plus an elapsed
+    hold window that it could drop to mode 0.  These tests pin down the physical
+    consequence: at the instant the drive is removed the arm is perfectly still,
+    and a fraction of a second later it is in free fall.  Only the torque keeps
+    the pose up, so removing it is an operator decision, never a timeout.
+    """
+
+    HOLD_Q = np.array(rr.SAFE_HOME, dtype=float)
+
+    def _sim(self) -> SimArm:
+        sim = SimArm(SimArmConfig(verify_model_on_connect=False,
+                                  collision_mode="none"))
+        sim.connect()
+        sim.set_joint_positions(self.HOLD_Q)
+        return sim
+
+    def _settle(self, sim: SimArm, seconds: float = 0.8) -> None:
+        """Hold the pose under active FOC until it is genuinely still."""
+        cmd = rr.ArmCommand.position(self.HOLD_Q, kp=80.0, kd=6.0)
+        steps = int(seconds / sim.config.timestep)
+        for _ in range(steps):
+            sim.write_command(cmd)
+            sim.advance(sim.config.timestep)
+
+    def test_foc_hold_does_keep_the_pose_under_gravity(self):
+        # Control case: with torque being produced, the pose is held.
+        sim = self._sim()
+        self._settle(sim)
+        max_dq = float(np.max(np.abs(sim.joint_velocities)))
+        drift = float(np.max(np.abs(sim.joint_positions - self.HOLD_Q)))
+        self.assertLess(max_dq, 1e-3, "FOC hold should leave the arm still")
+        self.assertLess(drift, 0.05, "FOC hold should keep the pose")
+
+        # And it is holding against a real gravity load, not floating free.
+        sim.write_command(rr.ArmCommand.stop())
+        fall = self._fall_after_cut(sim, seconds=0.3)
+        self.assertGreater(fall, 0.05,
+                           "pose must not survive losing the holding torque")
+
+    def test_zero_velocity_does_not_mean_the_pose_survives_the_cut(self):
+        sim = self._sim()
+        self._settle(sim)
+
+        # The exact precondition the old stop logic treated as "settled".
+        max_dq_at_cut = float(np.max(np.abs(sim.joint_velocities)))
+        self.assertLess(max_dq_at_cut, 1e-3)
+
+        sim.write_command(rr.ArmCommand.stop())  # mode 0: output removed
+        self._advance(sim, 0.002, 1)
+        self.assertGreater(float(np.max(np.abs(sim.joint_velocities))), 0.05,
+                           "stillness at the cut did not predict the fall")
+        self.assertGreater(self._fall_after_cut(sim, seconds=0.298), 0.05,
+                           "a gravity-loaded arm drops when de-energised")
+
+    def _advance(self, sim: SimArm, dt: float, steps: int) -> None:
+        for _ in range(steps):
+            sim.advance(dt)
+
+    def _fall_after_cut(self, sim: SimArm, seconds: float) -> float:
+        start = sim.joint_positions.copy()
+        self._advance(sim, sim.config.timestep,
+                      int(seconds / sim.config.timestep))
+        return float(np.max(np.abs(sim.joint_positions - start)))
+
+
 if __name__ == "__main__":
     unittest.main()

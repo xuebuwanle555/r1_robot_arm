@@ -54,7 +54,7 @@ def _config(timeout_s: float) -> "cb.ControlServiceConfig":
     cfg = cb.ControlServiceConfig()
     cfg.period_ns = 10_000_000          # 10 ms
     cfg.command_timeout_ns = int(timeout_s * 1e9)
-    cfg.stop_hold_ns = 50_000_000
+    cfg.stop_settle_ns = 50_000_000
     cfg.stop_vel_tol = 0.2
     cfg.hold_kp = 60.0
     cfg.hold_kd = 5.0
@@ -110,10 +110,14 @@ class TestControlServiceSimBridge(unittest.TestCase):
         self.assertTrue(service.fault_latched())
         self.assertEqual(service.last_fault_code(), "comm.watchdog_timeout")
         # It moves into the controlled stop and refuses to keep moving.
-        self.assertIn(
-            service.state(),
-            (cb.ServiceState.CONTROLLED_STOP, cb.ServiceState.MOTOR_DISABLED),
-        )
+        self.assertEqual(service.state(), cb.ServiceState.CONTROLLED_STOP)
+        self.assertEqual(service.stop_reason(), cb.StopReason.UPPER_LAYER_TIMEOUT)
+        # Keep cycling well past the old 500 ms hold window: the stop must hold
+        # under FOC and never drop the drive by itself, even with real physics.
+        for _ in range(80):
+            service.run_cycle()
+            sim.advance(dt)
+        self.assertEqual(service.state(), cb.ServiceState.CONTROLLED_STOP)
         # Re-enabling while latched is refused (a timeout never self-recovers).
         self.assertFalse(service.enable_motion(human_confirmed=True).ok)
 

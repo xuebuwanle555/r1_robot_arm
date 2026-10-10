@@ -26,13 +26,19 @@
 //
 // The three commanded states are distinct and named:
 //   * software-controlled hold  - active FOC holding position (holds a load)
-//   * controlled stop           - decelerate to zero velocity then hold, then
+//   * controlled stop           - decelerate to zero velocity and KEEP holding
+//                                 under active FOC, indefinitely
 //   * motor disabled            - mode 0 (removes output; NOT a brake)
 //
-// Everything here is hardware-independent and testable against MockArmBackend
-// (a real-hardware-style backend over MockJointBus).  Real-hardware timing and
-// the mode-0 "does it actually hold?" question remain HARDWARE_UNVERIFIED until
-// brought up per HARDWARE_BRINGUP.md.
+// Moving from a controlled stop to motor-disabled is NEVER automatic.  Zero
+// measured velocity and an elapsed hold window are not sufficient: the drive is
+// only removed on an explicit operator confirmation (`confirmMotorDisable`),
+// and only while feedback is valid and every joint has been observed still for
+// `stop_settle_ns`.  Losing feedback is a reason to keep holding, not a reason
+// to conclude the arm has stopped.
+//
+// Even a granted confirmation does not make mode 0 safe to fall into: whether
+// the R1 holds a gravity-loaded arm without torque is HARDWARE_UNVERIFIED.
 // ---------------------------------------------------------------------------
 
 #include <array>
@@ -60,11 +66,25 @@ enum class ServiceState {
   kEnabling,         ///< enable checks passed, arming pending the first tick
   kTrackingTrajectory, ///< streaming a buffered trajectory setpoint
   kSoftwareHold,     ///< active FOC holding the last position against a load
-  kControlledStop,   ///< fault latch engaged: decelerating to zero, then hold
+  kControlledStop,   ///< decelerating / holding under active FOC
   kMotorDisabled,    ///< mode 0 (output removed; NOT a brake)
 };
 
+/// WHY the service is in the controlled stop.  These are deliberately distinct:
+/// "the arm stopped" and "we lost the ability to tell" are not the same fact and
+/// must never be conflated when deciding whether the drive may be removed.
+enum class StopReason {
+  kNone,               ///< not in a controlled stop
+  kOperatorStop,       ///< an operator asked for a stop; nothing is wrong
+  kUpperLayerTimeout,  ///< the heartbeat went silent
+  kFeedbackLost,       ///< transport down / feedback stale or invalid: stillness
+                         ///< cannot be proven, so the drive must stay engaged
+  kActuatorFault,      ///< a motor reported an error
+  kUnsafeState,        ///< envelope / safety monitor violation
+};
+
 const char* toString(ServiceState state);
+const char* toString(StopReason reason);
 bool stateIsMotionActive(ServiceState state);  ///< hold / tracking
 
 struct ControlServiceConfig {
@@ -74,8 +94,13 @@ struct ControlServiceConfig {
 
   std::uint64_t period_ns = 10ULL * 1000ULL * 1000ULL;      ///< 100 Hz
   std::uint64_t command_timeout_ns = 200ULL * 1000ULL * 1000ULL;  ///< watchdog
-  std::uint64_t stop_hold_ns = 500ULL * 1000ULL * 1000ULL;  ///< hold after stop
-  double stop_vel_tol = 0.05;                                ///< [rad/s]
+
+  /// How long feedback must CONTINUOUSLY show every joint inside
+  /// `stop_vel_tol` before an operator may confirm drive removal.  This is a
+  /// precondition on a human decision, not a timer that discharges the drive by
+  /// itself: elapsed time alone is never evidence that de-energising is safe.
+  std::uint64_t stop_settle_ns = 500ULL * 1000ULL * 1000ULL;
+  double stop_vel_tol = 0.05;               ///< [rad/s]
 
   /// Gains used for the software-controlled hold and the trajectory tracking.
   double hold_kp = 40.0;
@@ -138,6 +163,13 @@ class ControlService {
   /// Request a controlled stop now (does not clear a latched fault).
   void requestControlledStop();
 
+  /// Operator-only confirmation that the drive may be removed (mode 0).
+  /// Refused unless the service is holding, feedback is currently valid, and
+  /// every joint has been observed still for at least `stop_settle_ns`.
+  /// Even when granted this is NOT a brake: whether mode 0 holds a
+  /// gravity-loaded R1 is `HARDWARE_UNVERIFIED`.
+  bool confirmMotorDisable(std::string* error);
+
   /// Run exactly ONE control cycle: refresh state, evaluate the watchdog and
   /// feedback safety, latch faults, and command the current setpoint.  The
   /// periodic thread calls this every `period_ns`; tests call it directly with a
@@ -150,6 +182,11 @@ class ControlService {
   // -- introspection (lock-free / safe to poll) ----------------------------
   ServiceStatus status() const;
   ServiceState state() const;
+  StopReason stopReason() const;
+  /// True only when feedback has *continuously* shown every joint still for
+  /// `stop_settle_ns`.  False whenever feedback is missing or a joint is
+  /// moving: absence of evidence is never evidence of absence.
+  bool stopHoldVerified() const;
   RobotState latestState() const;
   bool faultLatched() const;
   std::string lastFaultCode() const;
@@ -159,10 +196,14 @@ class ControlService {
   void threadMain();
   // Assumes mutex_ held.
   void latchFaultLocked(const std::string& code);
-  void beginControlledStopLocked();
+  void beginControlledStopLocked(StopReason reason);
   void sendToBackendLocked(const ArmCommand& cmd);
   JointVector rampLocked(const JointVector& target);
   bool trajectoryDoneLocked(std::uint64_t t) const;
+  /// Feedback we would be willing to base a decision on: connected, every joint
+  /// valid and fresh.  Assumes mutex_ held.
+  bool feedbackTrustedLocked(std::uint64_t t) const;
+  static StopReason stopReasonForFault(const std::string& code);
 
   ArmBackendPtr backend_;
   ControlServiceConfig config_;
@@ -188,8 +229,13 @@ class ControlService {
   bool has_pending_cmd_ = false;
 
   // Controlled-stop sequencing.
+  StopReason stop_reason_ = StopReason::kNone;
   std::uint64_t stop_engaged_ns_ = 0;
-  JointVector stop_target_{};
+  JointVector stop_target_{};       // the setpoint the FOC hold commands
+  /// Start of the current unbroken run of "valid feedback + every joint still".
+  /// 0 means "not currently observed still".
+  std::uint64_t stop_still_since_ns_ = 0;
+  bool stop_verified_ = false;
 
   // Trajectory buffer + smoothing.
   std::vector<TrajWaypoint> traj_{};

@@ -42,6 +42,47 @@ bool stateIsMotionActive(ServiceState state) {
          state == ServiceState::kSoftwareHold || state == ServiceState::kEnabling;
 }
 
+const char* toString(StopReason reason) {
+  switch (reason) {
+    case StopReason::kNone:
+      return "none";
+    case StopReason::kOperatorStop:
+      return "operator_stop";
+    case StopReason::kUpperLayerTimeout:
+      return "upper_layer_timeout";
+    case StopReason::kFeedbackLost:
+      return "feedback_lost";
+    case StopReason::kActuatorFault:
+      return "actuator_fault";
+    case StopReason::kUnsafeState:
+      return "unsafe_state";
+  }
+  return "unknown";
+}
+
+StopReason ControlService::stopReasonForFault(const std::string& code) {
+  if (code.rfind("comm.", 0) == 0) {
+    return StopReason::kUpperLayerTimeout;
+  }
+  if (code == "state.not_connected" || code == "state.stale_feedback" ||
+      code == "state.joint_invalid" || code == "state.no_feedback") {
+    return StopReason::kFeedbackLost;
+  }
+  if (code == "state.motor_error") {
+    return StopReason::kActuatorFault;
+  }
+  return StopReason::kUnsafeState;
+}
+
+bool ControlService::feedbackTrustedLocked(std::uint64_t t) const {
+  if (!latest_state_.connected || !latest_state_.allValid()) {
+    return false;  // no link, or a joint never reported a valid frame
+  }
+  // Reuse the safety monitor so "trustworthy feedback" means exactly one thing
+  // in this file: connected + per-joint valid + within max_feedback_age_s.
+  return monitor_.checkState(latest_state_, t).ok();
+}
+
 ControlService::ControlService(ArmBackendPtr backend, ControlServiceConfig config)
     : backend_(std::move(backend)),
       config_(std::move(config)),
@@ -222,7 +263,7 @@ void ControlService::submitTrajectory(const std::vector<TrajWaypoint>& waypoints
       const double hi = std::max(lim.upper - config_.safety.soft_limit_margin, centre);
       if (wp.q[si] < lo || wp.q[si] > hi) {
         latchFaultLocked("cmd.out_of_limits");
-        beginControlledStopLocked();
+        beginControlledStopLocked(StopReason::kUnsafeState);
         return;
       }
     }
@@ -243,7 +284,7 @@ void ControlService::requestControlledStop() {
       state_ == ServiceState::kControlledStop) {
     return;
   }
-  beginControlledStopLocked();
+  beginControlledStopLocked(StopReason::kOperatorStop);
 }
 
 bool ControlService::clearFault(std::string* error) {
@@ -281,22 +322,70 @@ void ControlService::latchFaultLocked(const std::string& code) {
   traj_.clear();
 }
 
-void ControlService::beginControlledStopLocked() {
+void ControlService::beginControlledStopLocked(StopReason reason) {
   // A controlled stop disables "motion enabled" (whether it was reached via a
   // latched fault or an explicit requestControlledStop()); resuming always
   // requires a fresh enableMotion(true).  Keep the gate ARMED so the
   // deceleration/hold frame can still be sent: the arm is caught by active FOC
   // rather than dropped (mode 0 alone is NOT a brake and cannot hold a
-  // gravity-loaded arm - HARDWARE_UNVERIFIED).  Only after the arm has stopped
-  // do we transition to motor-disabled and disarm.
+  // gravity-loaded arm - HARDWARE_UNVERIFIED).
+  //
+  // The hold target is the setpoint we were *commanding*, not the position
+  // feedback happens to report: when the stop was triggered precisely because
+  // feedback went bad, the measured value is stale and re-aiming at it would be
+  // a backward jump built out of the very data we stopped trusting.
   motion_enabled_ = false;
   has_pending_cmd_ = false;
   traj_.clear();
-  stop_target_ = latest_state_.q;
+
+  stop_target_ = has_last_target_ ? last_target_ : latest_state_.q;
   stop_engaged_ns_ = now();
+  stop_reason_ = reason;
+  stop_still_since_ns_ = 0;
+  stop_verified_ = false;
   has_last_target_ = true;
   last_target_ = stop_target_;
   state_ = ServiceState::kControlledStop;
+}
+
+bool ControlService::confirmMotorDisable(std::string* error) {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (!backend_ || state_ == ServiceState::kUnconnected) {
+    if (error) {
+      *error = "refused: not connected";
+    }
+    return false;
+  }
+  if (state_ == ServiceState::kMotorDisabled) {
+    return true;  // already the requested end state
+  }
+  const std::uint64_t t = now();
+  if (!feedbackTrustedLocked(t)) {
+    if (error) {
+      *error =
+          "refused: feedback is not currently valid, so stillness cannot be "
+          "proven; the drive stays engaged (a stop with lost feedback is not a "
+          "verified stop)";
+    }
+    return false;
+  }
+  if (!stop_verified_) {
+    if (error) {
+      *error = "refused: joints have not been observed still for the full " +
+               std::to_string(config_.stop_settle_ns / 1000000ULL) +
+               " ms settle window";
+    }
+    return false;
+  }
+  // Operator-confirmed drive removal.  This is still NOT a brake.
+  backend_->setMotionArmed(false, control_);
+  backend_->stop();  // mode 0
+  state_ = ServiceState::kMotorDisabled;
+  motion_enabled_ = false;
+  if (error) {
+    error->clear();
+  }
+  return true;
 }
 
 void ControlService::sendToBackendLocked(const ArmCommand& cmd) {
@@ -336,32 +425,44 @@ void ControlService::runCycle() {
   }();
   ++ticks_;
 
-  // 1) Controlled-stop / motor-disable sequencing.  Runs for a stop reached via
-  //    a latched fault OR an explicit requestControlledStop(), independent of the
-  //    watchdog.  Decelerate under active FOC, then drop to mode 0 and disarm.
+  // 1) Controlled-stop sequencing.  Runs for a stop reached via a latched fault
+  //    OR an explicit requestControlledStop(), independent of the watchdog.
+  //
+  //    The stop holds under ACTIVE FOC and stays there.  Nothing in this branch
+  //    removes the drive: zero velocity plus an elapsed timer is not proof that
+  //    de-energising is safe, and lost feedback is even less so.  Only the
+  //    operator's confirmMotorDisable() may cross into kMotorDisabled.
   if (state_ == ServiceState::kControlledStop) {
-    const bool settled = [&] {
-      if (!latest_state_.connected) {
-        return true;  // cannot command a dead port; treat as stopped
-      }
+    const bool trusted = feedbackTrustedLocked(t);
+    bool still_now = trusted;
+    if (still_now) {
       for (int i = 0; i < kNumJoints; ++i) {
         if (std::fabs(latest_state_.dq[static_cast<std::size_t>(i)]) >
             config_.stop_vel_tol) {
-          return false;
+          still_now = false;
+          break;
         }
       }
-      return true;
-    }();
-    const bool held = (t - stop_engaged_ns_) >= config_.stop_hold_ns;
-    if (settled && held) {
-      backend_->setMotionArmed(false, control_);  // close the write path
-      backend_->stop();                           // mode 0; NOT a brake
-      state_ = ServiceState::kMotorDisabled;
-    } else {
-      ArmCommand hold =
-          ArmCommand::position(stop_target_, config_.hold_kp, config_.hold_kd);
-      sendToBackendLocked(hold);
     }
+    if (still_now) {
+      if (stop_still_since_ns_ == 0) {
+        stop_still_since_ns_ = t;
+      }
+      if ((t - stop_still_since_ns_) >= config_.stop_settle_ns) {
+        stop_verified_ = true;  // settle window observed without a break
+      }
+    } else {
+      // Lost feedback, or a joint moving: the settle run restarts and any prior
+      // verification is withdrawn.  We deliberately do NOT keep a stale
+      // "verified" flag, because that would let an operator drop the drive on
+      // evidence from a moment we can no longer see.
+      stop_still_since_ns_ = 0;
+      stop_verified_ = false;
+    }
+
+    ArmCommand hold =
+        ArmCommand::position(stop_target_, config_.hold_kp, config_.hold_kd);
+    sendToBackendLocked(hold);
     return;
   }
   if (state_ == ServiceState::kMotorDisabled) {
@@ -371,7 +472,7 @@ void ControlService::runCycle() {
   // 2) A latched fault that is not yet in the controlled stop routes into it on
   //    the next tick.  It can never leave this state on its own.
   if (fault_latched_) {
-    beginControlledStopLocked();
+    beginControlledStopLocked(stopReasonForFault(last_fault_code_));
     return;
   }
 
@@ -380,12 +481,12 @@ void ControlService::runCycle() {
     const bool upper_alive = (t - last_upper_contact_ns_) <= config_.command_timeout_ns;
     if (!upper_alive) {
       latchFaultLocked("comm.watchdog_timeout");
-      beginControlledStopLocked();
+      beginControlledStopLocked(StopReason::kUpperLayerTimeout);
       return;
     }
     if (!latest_state_.connected) {
       latchFaultLocked("state.not_connected");
-      beginControlledStopLocked();
+      beginControlledStopLocked(StopReason::kFeedbackLost);
       return;
     }
     const SafetyReport rep = monitor_.checkState(latest_state_, t);
@@ -394,7 +495,7 @@ void ControlService::runCycle() {
           rep.faultCodes().empty() ? std::string("state.unsafe")
                                    : rep.faultCodes().front();
       latchFaultLocked(code);
-      beginControlledStopLocked();
+      beginControlledStopLocked(stopReasonForFault(code));
       return;
     }
   } else {
@@ -466,12 +567,12 @@ void ControlService::runCycle() {
                                    ? std::string("cmd.unsafe")
                                    : cmd_rep.faultCodes().front();
       latchFaultLocked(code);
-      beginControlledStopLocked();
+      beginControlledStopLocked(stopReasonForFault(code));
       return;
     }
     if (backend_->isRealHardware() && !backend_->motionArmed()) {
       latchFaultLocked("internal.disarmed_while_enabled");
-      beginControlledStopLocked();
+      beginControlledStopLocked(StopReason::kUnsafeState);
       return;
     }
     if (state_ != ServiceState::kTrackingTrajectory) {
@@ -505,6 +606,17 @@ ServiceStatus ControlService::status() const {
 ServiceState ControlService::state() const {
   std::lock_guard<std::mutex> lock(mutex_);
   return state_;
+}
+
+StopReason ControlService::stopReason() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return state_ == ServiceState::kControlledStop ? stop_reason_
+                                                  : StopReason::kNone;
+}
+
+bool ControlService::stopHoldVerified() const {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return stop_verified_;
 }
 
 RobotState ControlService::latestState() const {
