@@ -72,7 +72,7 @@ from .safety import (
     SafetyMonitor,
     SafetyReport,
 )
-from .sim import SimArm, SimArmConfig, generate_mjcf, write_sim_model
+from .sim import SimArm, SimArmConfig, generate_mjcf, write_sim_model, dynamics_provenance
 from .trajectory import (
     ExecutionResult,
     ExecutorConfig,
@@ -151,6 +151,7 @@ __all__ = [
     "SimArmConfig",
     "generate_mjcf",
     "write_sim_model",
+    "dynamics_provenance",
     # trajectory / execution
     "JointTrajectory",
     "TrajectoryExecutor",

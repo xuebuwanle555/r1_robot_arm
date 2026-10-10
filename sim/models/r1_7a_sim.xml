@@ -28,7 +28,7 @@
   <worldbody>
     <light name="key" pos="0.5 -0.5 1.5" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>
     <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 -0.02" rgba="0.35 0.35 0.4 1" condim="3"/>
-    <body name="base_link">
+        <body name="base_link">
       <inertial pos="-0.00010643 0.0010041 0.023203" mass="1.7759" fullinertia="0.0014112 0.001783 0.0025584 1.7968e-06 1.2255e-06 -8.2296e-06"/>
       <geom name="base_link_visual" type="mesh" mesh="base_link" class="visual" pos="0 0 0" quat="1 0 0 0"/>
       <geom name="base_link_collision" type="mesh" mesh="base_link" class="collision" pos="0 0 0" quat="1 0 0 0"/>

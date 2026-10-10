@@ -147,6 +147,76 @@ class TestExecutorOutcomes(unittest.TestCase):
                 tau_ff=lambda q: np.zeros(3),
             )
 
+    def test_briefly_passing_through_the_target_without_dwelling_is_not_reached(
+        self,
+    ):
+        """A joint that crosses the goal position while still moving — and never
+        dwells — must NOT be reported as REACHED.
+
+        REACHED requires the position error AND the joint velocity to be inside
+        tolerance, held continuously for settle_hold_s.  Here the arm reaches the
+        exact goal position (final_error == 0) but with velocity 1.0 rad/s, so it
+        is still passing through: this is a NOT_REACHED failure.  (It also proves
+        the timeout branch can no longer hand out REACHED just because the sample
+        position happened to land inside tolerance at the budget.)
+        """
+        robot = _PassThroughRobot(GOAL)
+        executor = rr.TrajectoryExecutor(
+            rr.ExecutorConfig(
+                dt=0.1,
+                settle_tol=0.02,
+                settle_vel_tol=0.05,
+                settle_hold_s=0.1,
+                extra_time_s=0.5,
+            )
+        )
+        result = executor.run(
+            robot, rr.JointTrajectory.from_waypoints([(0.0, HOME), (0.5, GOAL)])
+        )
+        self.assertIs(result.outcome, rr.Outcome.NOT_REACHED, msg=result.detail)
+        # It did get the position right, momentarily...
+        self.assertLess(result.final_error.max(), 0.02)
+        # ...but it was still moving, so it never settled.
+        self.assertFalse(result.ok)
+
+
+class _PassThroughRobot:
+    """Test stub: drives its own position/velocity trace, ignoring the setpoint.
+
+    Reaches the goal position at t = 0.5 s with a residual velocity of 1.0 rad/s
+    and keeps "moving through" it — the exact non-dwelling case the executor must
+    reject.  Presents the R1Robot surface the executor uses (backend / refresh /
+    send_action / state) so it exercises the real REACHED predicate.
+    """
+
+    def __init__(self, goal: np.ndarray) -> None:
+        self._goal = np.asarray(goal, dtype=float).copy()
+        self._t = 0.0
+
+    @property
+    def backend(self):
+        return self
+
+    @property
+    def state(self):
+        return self.refresh()
+
+    def advance(self, dt: float) -> None:
+        self._t += dt
+
+    def send_action(self, cmd) -> None:  # noqa: ARG002 - trace is time-driven
+        return None
+
+    def refresh(self):
+        st = rr.RobotState(connected=True)
+        st.valid[:] = True
+        st.voltage[:] = 48.0
+        st.temperature_c[:] = 30.0
+        if self._t >= 0.3:
+            st.q = self._goal.copy()
+            st.dq[:] = 1.0  # still moving through the target: not settled
+        return st
+
 
 class TestTrajectoryLimits(unittest.TestCase):
     """Joint velocity / acceleration limits and automatic time scaling."""

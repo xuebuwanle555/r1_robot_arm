@@ -129,7 +129,7 @@ class TestCollisionAndLimits(unittest.TestCase):
     def setUpClass(cls):
         cls.model = mujoco.MjModel.from_xml_path(str(SIM_MODEL_PATH))
 
-    def test_collision_geoms_exist_but_are_disabled_by_default(self):
+    def test_collision_geoms_exist_and_are_off_in_kinematics_mode(self):
         names = [
             mujoco.mj_id2name(self.model, mujoco.mjtObj.mjOBJ_GEOM, i)
             for i in range(self.model.ngeom)
@@ -138,43 +138,103 @@ class TestCollisionAndLimits(unittest.TestCase):
         visuals = [n for n in names if n and n.endswith("_visual")]
         self.assertEqual(len(collisions), 8)
         self.assertEqual(len(visuals), 8)
-        # Collisions are off in the generated model: phase-2 control does not
-        # rely on contact yet, and mesh-mesh contact is expensive.
+        # The on-disk model is generated in the default "none" (pure-kinematics)
+        # mode: every geom carries a zero contact mask.
         for i in range(self.model.ngeom):
-            name = names[i]
-            if name and name.endswith("_floor"):
-                continue
             self.assertEqual(self.model.geom_contype[i], 0)
             self.assertEqual(self.model.geom_conaffinity[i], 0)
 
-    def test_enabling_collision_sets_the_masks(self):
-        arm = SimArm(SimArmConfig(enable_collision=True))
-        self.assertTrue(np.all(arm.model.geom_contype != 0))
-        self.assertTrue(np.all(arm.model.geom_conaffinity != 0))
+    def test_kinematics_mode_hides_a_real_collision(self):
+        """"none" must NOT be used for contact / grasp experiments.
 
-    def test_no_self_collision_is_detected_in_folded_poses(self):
-        """Recorded finding, NOT a safety guarantee.
-
-        Deeply folded configurations of this URDF produce no self-contact in
-        MuJoCo, so self-collision limits are NOT validated by it.  If a future
-        model/mesh change introduces contact, this test fails on purpose and
-        forces the collision story to be revisited.
+        The same pose that registers a tabletop collision in "environment" mode
+        registers nothing here, because contact is compiled off.  This asserts the
+        hazard explicitly so nobody re-enables the old blanket mask write.
         """
-        model = mujoco.MjModel.from_xml_path(str(SIM_MODEL_PATH))
-        model.geom_contype[:] = 1
-        model.geom_conaffinity[:] = 1
-        data = mujoco.MjData(model)
-        folded = [
-            np.array([0.0, 0.05, 3.40, 3.00, 0.05, 0.00, 0.00]),
-            np.array([0.0, 0.05, 3.45, 3.09, 0.05, 0.45, 0.00]),
-            np.array([0.0, 1.60, 3.40, 3.00, 0.00, 0.00, 0.00]),
-            np.array([0.0, 0.06, 3.44, 3.09, 0.06, 0.47, 1.50]),
-        ]
-        for q in folded:
-            data.qpos[:] = q
-            data.qvel[:] = 0.0
-            mujoco.mj_forward(model, data)
-            self.assertEqual(data.ncon, 0, msg=f"self-contact appeared at q={q}")
+        arm = SimArm(SimArmConfig(collision_mode="none", add_table=True,
+                                  gravity=(0, 0, 0), verify_model_on_connect=False))
+        arm.connect()
+        arm.set_joint_positions(rr.SAFE_HOME)
+        self.assertEqual(arm.contact_count(), 0)
+
+    def test_environment_mode_detects_a_designed_tabletop_collision(self):
+        """Acceptance: MuJoCo detects a pre-designed collision scenario."""
+        arm = SimArm(SimArmConfig(collision_mode="environment", add_table=True,
+                                  gravity=(0, 0, 0), verify_model_on_connect=False))
+        arm.connect()
+        arm.set_joint_positions(rr.SAFE_HOME)  # links reach forward onto the table
+        self.assertGreater(arm.contact_count(), 0)
+        # Every contact involves the tabletop; no arm-vs-arm contact is possible.
+        for a, b in arm.colliding_geoms():
+            self.assertTrue("tabletop" in (a, b), msg=(a, b))
+        self.assertEqual(arm.self_contact_pairs(), set())
+
+    def test_environment_mode_nominal_pose_is_clear(self):
+        """No fixture -> the stowed arm touches nothing but sits above the floor."""
+        arm = SimArm(SimArmConfig(collision_mode="environment",
+                                  gravity=(0, 0, 0), verify_model_on_connect=False))
+        arm.connect()
+        arm.set_joint_positions(rr.SAFE_HOME)
+        self.assertEqual(arm.contact_count(), 0)
+
+    def test_self_mode_nominal_is_clean_but_a_fold_is_detected(self):
+        """Self-collision: adjacent/hull-artifact pairs are excluded so a nominal
+        arm reads zero self contacts, yet a genuine fold (wrist across the upper
+        arm) is detected."""
+        arm = SimArm(SimArmConfig(collision_mode="self",
+                                  gravity=(0, 0, 0), verify_model_on_connect=False))
+        arm.connect()
+        arm.set_joint_positions(rr.SAFE_HOME)
+        self.assertEqual(arm.self_contact_pairs(), set())  # no hull false positives
+
+        fold = np.array([0.72, 2.26, 0.1, 0.03, -1.87, 0.37, -1.47])
+        arm.set_joint_positions(fold)
+        self.assertGreater(len(arm.self_contact_pairs()), 0,
+                           msg="a deeply folded pose must register self-contact")
+
+    def test_runtime_mask_write_does_not_enable_contacts(self):
+        """Regression for the silent no-op that hid this bug for a whole release.
+
+        Writing geom_contype/conaffinity after the model is compiled does not
+        start detecting contacts in MuJoCo 3.x; only the authored XML does.  This
+        is why collision_mode is a *generation* parameter, not a runtime toggle.
+        """
+        arm = SimArm(SimArmConfig(collision_mode="none", add_table=True,
+                                  gravity=(0, 0, 0), verify_model_on_connect=False))
+        arm.connect()
+        arm.set_joint_positions(rr.SAFE_HOME)
+        # Blanket-enable every mask at runtime, exactly like the old buggy flag.
+        arm.model.geom_contype[:] = 1
+        arm.model.geom_conaffinity[:] = 1
+        arm.set_joint_positions(rr.SAFE_HOME)  # re-run forward
+        self.assertEqual(
+            arm.contact_count(), 0,
+            msg="runtime mask writes must not resurrect contact detection",
+        )
+
+    def test_controller_saturation_clamps_actuator_output(self):
+        """A demand beyond the actuator ctrlrange is clamped (saturation)."""
+        arm = SimArm(SimArmConfig(gravity=(0, 0, 0)))
+        arm.connect()
+        big = 1.0e9
+        arm.data.ctrl[arm._act_ids] = big
+        mujoco.mj_forward(arm.model, arm.data)
+        # gaintype=fixed gain=1, so actuator_force == clamped ctrl.
+        self.assertTrue(np.all(arm.data.actuator_force <= 1.0e5 + 1.0),
+                        msg="actuator output did not saturate at ctrlrange")
+        self.assertTrue(np.all(arm.data.actuator_force >= 0.0))
+
+    def test_dynamics_provenance_is_fully_labelled(self):
+        prov = rr.dynamics_provenance()
+        for key in ("link_mass", "link_inertia", "joint_range", "joint_damping",
+                    "joint_armature", "friction", "gear_ratio_and_stiffness",
+                    "actuator_torque_limit", "collision_geometry"):
+            self.assertIn(key, prov)
+            self.assertTrue(prov[key])
+        # Official vs assumption provenance is distinguishable.
+        self.assertIn("official", prov["link_mass"])
+        self.assertIn("hardware", prov["joint_damping"])
+        self.assertIn("HARDWARE_UNVERIFIED", prov["gear_ratio_and_stiffness"])
 
     def test_joint_limits_are_enforced_by_the_simulation(self):
         """Limits must resist a 1 rad overshoot command.

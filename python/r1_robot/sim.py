@@ -49,6 +49,112 @@ SIM_SUPPLY_VOLTAGE = 48.0
 #: Actuator control range.  Wide, because `ctrl` carries kp*q_des + tau_ff.
 _CTRL_RANGE = 1.0e5
 
+# ---------------------------------------------------------------------------
+# Collision modes (Task 5).
+#
+# IMPORTANT: in MuJoCo 3.x the contact masks MUST be authored in the XML.  A
+# runtime write to `model.geom_contype` after `from_xml_string` is silently
+# ignored (the model is compiled on load), which is why the old `enable_collision`
+# flag was a no-op and no collision was ever actually detected here.
+#
+# Modes:
+#   * "none"        - no geom collides.  For PURE KINEMATICS / FK cross-checks.
+#                     MUST NOT be used for contact or grasp experiments: it hides
+#                     real collisions (a test asserts this explicitly).
+#   * "environment" - arm links collide with the world (floor + optional table)
+#                     but NOT with each other (arm-arm bitmask disabled).  This
+#                     reliably detects desktop / fixture collisions and is immune
+#                     to the convex-hull false positives of the STL meshes.
+#   * "self"        - arm links ALSO collide with each other.  The meshes are
+#                     CONCAVE, so their convex hulls overlap for geometrically
+#                     adjacent pairs regardless of pose; those pairs (and the one
+#                     concentric artifact Link5<->Link7) are removed with explicit
+#                     <contact><exclude> entries so a nominal arm reads 0 contacts
+#                     and a genuine fold (wrist onto elbow/base) is detected.  The
+#                     hull approximation makes this CONSERVATIVE: it can miss thin
+#                     interpenetrations and over-report near-adjacent ones.
+# ---------------------------------------------------------------------------
+COLLISION_MODES = ("none", "environment", "self")
+
+#: Body-name pairs excluded from self-collision (jointless/adjacent + the one
+#: concentric hull artifact).  Everything else that overlaps is a real contact.
+SELF_COLLISION_EXCLUDES: tuple[tuple[str, str], ...] = (
+    ("base_link", "Link1"),
+    ("Link1", "Link2"),
+    ("Link2", "Link3"),
+    ("Link3", "Link4"),
+    ("Link4", "Link5"),
+    ("Link5", "Link6"),
+    ("Link6", "Link7"),
+    ("Link5", "Link7"),
+)
+
+#: A tabletop used for environment-collision validation (world-fixed body).
+_TABLE_BOX = (
+    '<body name="table_static">\n'
+    '      <geom name="tabletop" type="box" size="0.2 0.2 0.02" '
+    'pos="0.25 0 0.22" contype="2" conaffinity="1" rgba="0.6 0.4 0.2 1"/>\n'
+    "    </body>\n    "
+)
+
+
+def _collision_class_geom(mode: str) -> str:
+    """contype/conaffinity for the 'collision' default class, per mode."""
+    if mode == "none":
+        return '<geom group="3" contype="0" conaffinity="0"/>'
+    if mode == "environment":
+        # collides with the world (bit 1) only, never with other arm links.
+        return '<geom group="3" contype="1" conaffinity="2"/>'
+    if mode == "self":
+        return '<geom group="3" contype="1" conaffinity="1"/>'
+    raise ValueError(f"unknown collision_mode {mode!r} (expected one of {COLLISION_MODES})")
+
+
+def _floor_geom(mode: str) -> str:
+    """The floor plane: participates in contact only outside kinematics mode."""
+    masks = "" if mode == "none" else ' contype="2" conaffinity="1"'
+    return (
+        '<geom name="floor" type="plane" size="2 2 0.1" pos="0 0 -0.02" '
+        'rgba="0.35 0.35 0.4 1" condim="3"' + masks + "/>"
+    )
+
+
+def _contact_block(mode: str) -> str:
+    if mode != "self":
+        return ""
+    excludes = "".join(
+        f'    <exclude body1="{a}" body2="{b}"/>\n'
+        for a, b in SELF_COLLISION_EXCLUDES
+    )
+    return f"\n  <contact>\n{excludes}  </contact>\n"
+
+
+# ---------------------------------------------------------------------------
+# Dynamics-parameter provenance (Task 5).
+#
+# Every dynamics quantity is tagged so a reader knows which numbers are traceable
+# to the official model and which are assumptions pending real-arm identification.
+# ---------------------------------------------------------------------------
+DYNAMICS_PROVENANCE: dict[str, str] = {
+    "link_mass": "official (URDF inertial <mass>)",
+    "link_inertia": "official (URDF inertial <inertia>, rotated into body frame)",
+    "joint_range": "official (URDF <limit lower/upper>)",
+    "joint_axis_origin": "official (URDF <origin>/<axis>)",
+    "gravity": "official constant 9.81 m/s^2",
+    "joint_damping": "simulation assumption (0.2 Nm/(rad/s)); to be identified on hardware [HARDWARE_UNVERIFIED]",
+    "joint_armature": "simulation assumption (0.01 kg m^2); to be identified on hardware [HARDWARE_UNVERIFIED]",
+    "friction": "simulation assumption (1 0.005 0.0001); to be identified on hardware [HARDWARE_UNVERIFIED]",
+    "gear_ratio_and_stiffness": "to be identified on hardware - the IM6014 ratio is inside the motor firmware, not the SDK [HARDWARE_UNVERIFIED]",
+    "actuator_torque_limit": "to be identified on hardware - ctrlrange is intentionally wide here [HARDWARE_UNVERIFIED]",
+    "collision_geometry": "simulation assumption - convex hull of the visual STL; conservative for self-collision",
+}
+
+
+def dynamics_provenance() -> dict[str, str]:
+    """Return the provenance tag for each dynamics parameter group."""
+    return dict(DYNAMICS_PROVENANCE)
+
+
 
 # ---------------------------------------------------------------------------
 # URDF -> MJCF
@@ -72,11 +178,23 @@ def _fmt(values) -> str:
     return " ".join(f"{float(v):.10g}" for v in values)
 
 
-def generate_mjcf(meshdir: str | Path | None = None) -> str:
+def generate_mjcf(
+    meshdir: str | Path | None = None,
+    collision_mode: str = "none",
+    add_table: bool = False,
+) -> str:
     """Build a MuJoCo MJCF string from the official R1-7A URDF.
 
     ``meshdir`` is where the STL files live (default: the SDK mesh directory).
+    ``collision_mode`` is one of COLLISION_MODES ("none" / "environment" /
+    "self") and must be authored here - see the collision-mode note above for
+    why a runtime mask write cannot enable contacts in MuJoCo 3.x.
+    ``add_table`` places a fixed tabletop used for environment-collision tests.
     """
+    if collision_mode not in COLLISION_MODES:
+        raise ValueError(
+            f"unknown collision_mode {collision_mode!r} (expected one of {COLLISION_MODES})"
+        )
     urdf = official_urdf_path()
     meshdir = Path(meshdir) if meshdir is not None else OFFICIAL_MESH_DIR
     root = ET.parse(str(urdf)).getroot()
@@ -203,6 +321,12 @@ def generate_mjcf(meshdir: str | Path | None = None) -> str:
         for i in range(NUM_JOINTS)
     )
 
+    collision_geom = _collision_class_geom(collision_mode)
+    floor_geom = _floor_geom(collision_mode)
+    table_geom = f"    {_TABLE_BOX}" if add_table else ""
+    robot_body = body(LINK_NAMES[0], 2)
+    contact_xml = _contact_block(collision_mode)
+
     return (
         '<?xml version="1.0" encoding="UTF-8"?>\n'
         '<mujoco model="R1_Robotic_Arm_sim">\n'
@@ -219,16 +343,16 @@ def generate_mjcf(meshdir: str | Path | None = None) -> str:
         '      <geom group="2" contype="0" conaffinity="0"/>\n'
         "    </default>\n"
         '    <default class="collision">\n'
-        '      <geom group="3" contype="0" conaffinity="0"/>\n'
+        f"      {collision_geom}\n"
         "    </default>\n"
         "  </default>\n"
         f"  <asset>\n{asset}  </asset>\n"
         "  <worldbody>\n"
         '    <light name="key" pos="0.5 -0.5 1.5" dir="0 0 -1" diffuse="0.8 0.8 0.8"/>\n'
-        '    <geom name="floor" type="plane" size="2 2 0.1" pos="0 0 -0.02" '
-        'rgba="0.35 0.35 0.4 1" condim="3"/>\n'
-        f"{body(LINK_NAMES[0], 2)}"
+        f"    {floor_geom}\n"
+        f"    {table_geom}{robot_body}"
         "  </worldbody>\n"
+        f"{contact_xml}"
         f"  <actuator>\n{actuators}  </actuator>\n"
         "</mujoco>\n"
     )
@@ -259,9 +383,14 @@ class SimArmConfig:
     timestep: float = 0.002
     #: Gravity vector [m/s^2]; zero disables gravity (useful for FK-only tests).
     gravity: tuple[float, float, float] = (0.0, 0.0, -9.81)
-    #: Enable mesh-vs-mesh contact (off by default: expensive, and the phase-2
-    #: controller does not rely on contact yet).
-    enable_collision: bool = False
+    #: Contact handling, authored into the generated model (see COLLISION_MODES):
+    #:   "none"        - pure kinematics, no contact (NOT for grasp experiments)
+    #:   "environment" - arm collides with floor / table, never with itself
+    #:   "self"        - arm also self-collides (hull meshes, adjacent pairs
+    #:                   excluded so a nominal arm reads zero contacts)
+    collision_mode: str = "none"
+    #: Place a fixed tabletop in front of the arm for environment-collision tests.
+    add_table: bool = False
     #: Reported by has_valid_calibration(); False exercises the refusal path.
     calibration_ok: bool = True
     #: Artificial feedback age [s] reported in RobotState.stamp_ns.
@@ -282,18 +411,17 @@ class SimArm(ArmBackend):
         if self.config.model_path is not None:
             self.model = mujoco.MjModel.from_xml_path(str(self.config.model_path))
         else:
+            # Collision masks and contact filters MUST be authored in the XML: a
+            # runtime write to geom_contype is ignored once the model is compiled.
             self.model = mujoco.MjModel.from_xml_string(
-                generate_mjcf(OFFICIAL_MESH_DIR)
+                generate_mjcf(
+                    OFFICIAL_MESH_DIR,
+                    collision_mode=self.config.collision_mode,
+                    add_table=self.config.add_table,
+                )
             )
         self.model.opt.timestep = float(self.config.timestep)
         self.model.opt.gravity[:] = np.asarray(self.config.gravity, dtype=np.float64)
-
-        if self.config.enable_collision:
-            self.model.geom_contype[:] = 1
-            self.model.geom_conaffinity[:] = 1
-        else:
-            self.model.geom_contype[:] = 0
-            self.model.geom_conaffinity[:] = 0
 
         self.data = mujoco.MjData(self.model)
 
@@ -389,6 +517,40 @@ class SimArm(ArmBackend):
                 self._mj.mj_step(self.model, self.data)
         finally:
             self.model.opt.timestep = saved
+
+    # -- contact inspection -------------------------------------------------
+    def contact_count(self) -> int:
+        """Number of active contact pairs after the latest forward/step.
+
+        Call ``set_joint_positions`` (which runs mj_forward) first to refresh.
+        """
+        return int(self.data.ncon)
+
+    def colliding_geoms(self) -> set[tuple[str, str]]:
+        """Sorted (geom_a, geom_b) name pairs currently in contact.
+
+        Geom names carry the ``_visual`` / ``_collision`` / ``tabletop`` / ``floor``
+        suffix, so a caller can tell an arm-arm contact from an arm-table contact.
+        """
+        pairs: set[tuple[str, str]] = set()
+        for i in range(self.data.ncon):
+            c = self.data.contact[i]
+            a = self._mj.mj_id2name(
+                self.model, self._mj.mjtObj.mjOBJ_GEOM, c.geom1
+            )
+            b = self._mj.mj_id2name(
+                self.model, self._mj.mjtObj.mjOBJ_GEOM, c.geom2
+            )
+            pairs.add(tuple(sorted((a, b))))
+        return pairs
+
+    def self_contact_pairs(self) -> set[tuple[str, str]]:
+        """Contact pairs where BOTH geoms are arm collision geoms."""
+        return {
+            pair
+            for pair in self.colliding_geoms()
+            if all(g.endswith("_collision") for g in pair)
+        }
 
     @property
     def simulated_time_s(self) -> float:

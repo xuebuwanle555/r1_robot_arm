@@ -12,7 +12,12 @@
 #   * MOTOR_FAULT  - the backend reported a non-zero motor error code
 #   * TIMEOUT      - the motion did not settle inside the time budget
 #   * NOT_REACHED  - time ran out but the arm settled far from the target
-#   * REACHED      - every joint settled within tolerance of the goal
+#   * REACHED      - the arm held *inside both* the joint-position tolerance and
+#                    the joint-velocity tolerance, continuously, for settle_hold_s
+#                    after the trajectory time.  Merely passing through the goal
+#                    while still moving, or touching the budget while inside
+#                    tolerance, is NOT enough: the timeout branch can never grant
+#                    REACHED.
 #
 # The executor does NOT arm motion: the caller must call
 # `R1Robot.enable_motion(human_confirmed=True)` first.  A trajectory never
@@ -278,7 +283,10 @@ class ExecutorConfig:
     dt: float = 0.002
     #: Goal tolerance per joint [rad].
     settle_tol: float = 0.02
-    #: How long the arm must stay inside `settle_tol` to count as settled [s].
+    #: Velocity tolerance per joint [rad/s]: the arm must be essentially still.
+    #: A joint crossing the goal while still moving has NOT settled.
+    settle_vel_tol: float = 0.05
+    #: How long the arm must stay inside both tolerances to count as settled [s].
     settle_hold_s: float = 0.1
     #: Extra time allowed *after* the trajectory end before declaring a timeout.
     extra_time_s: float = 1.0
@@ -369,29 +377,35 @@ class TrajectoryExecutor:
                 on_step(t, state)
 
             error = np.abs(np.asarray(state.q) - goal)
+            speed = np.abs(np.asarray(state.dq))
             max_error = max(max_error, float(np.max(error)))
 
-            if t >= trajectory.duration and float(np.max(error)) <= cfg.settle_tol:
+            # Settled only if the arm is inside BOTH the position and velocity
+            # tolerance and has been there continuously for `settle_hold_s`.  A
+            # joint merely passing through the goal while still moving is not
+            # settled (velocity fails) and does not accumulate dwell time.
+            if (
+                t >= trajectory.duration
+                and float(np.max(error)) <= cfg.settle_tol
+                and float(np.max(speed)) <= cfg.settle_vel_tol
+            ):
                 settled_for += cfg.dt
                 if settled_for >= cfg.settle_hold_s:
                     return ExecutionResult(
                         Outcome.REACHED, t, float(np.max(error)),
                         int(np.argmax(error)), error,
-                        "settled within tolerance",
+                        f"settled within tolerance (worst |dq|="
+                        f"{float(np.max(speed)):.4f} rad/s)",
                     )
             else:
                 settled_for = 0.0
 
             if t + cfg.dt > timeout:
+                # The time budget expired without a sustained, stationary settle.
+                # REACHED is intentionally NOT available on this branch: a timeout
+                # must never substitute for the stable-time requirement.
                 err = np.abs(np.asarray(state.q) - goal)
-                reached = float(np.max(err)) <= cfg.settle_tol
                 worst = int(np.argmax(err))
-                if reached:
-                    # Inside tolerance but never held long enough -> still ok.
-                    return ExecutionResult(
-                        Outcome.REACHED, t, float(np.max(err)), worst, err,
-                        "within tolerance at the time budget",
-                    )
                 outcome = Outcome.NOT_REACHED if t >= trajectory.duration else Outcome.TIMEOUT
                 return ExecutionResult(
                     outcome, t, max_error, worst, err,
