@@ -35,7 +35,10 @@ These are enforced in code, not just in documentation:
 | 6 | **Unverifiable parameters are labelled, not guessed.** Search the tree for `TODO(bringup)` and `待验证`. | throughout |
 | 7 | **`stop()` is not a brake.** It sends mode 0 (motor output disabled) and *cannot* hold an arm loaded by gravity. | `HARDWARE_BRINGUP.md` §6 |
 | 8 | **The motion lock cannot be disarmed by ordinary business code.** `setMotionArmed()`/`probeFeedback()` require an unforgeable `MotionControl` token that only `R1Arm`/`ControlService` can mint (private ctor + friend); `R1Arm::backend()` returns a `const` read-only handle so actuating calls will not compile. | `include/r1_robot/motion_control.hpp`, `tests/test_hardware_gate.cpp` |
-| 9 | **Exactly one owner writes to the hardware bus.** `ControlService` owns the backend, runs the periodic loop and a command-timeout watchdog, latches faults (upper-layer silence / stale feedback / motor error) and never auto-re-arms after a timeout. | `src/control_service.cpp`, `tests/test_control_service.cpp` |
+| 9 | **Exactly one owner writes to the hardware bus.** `ControlService` owns the backend, runs the periodic loop and a command-timeout watchdog, latches faults (upper-layer silence / stale feedback / motor error / a send that never reached the arm) and never auto-re-arms after a timeout. | `src/control_service.cpp`, `tests/test_control_service.cpp` |
+| 10 | **A controlled stop holds under active FOC and never removes the drive by itself.** Zero velocity plus an elapsed timer is not evidence that de-energising is safe, and lost feedback is not evidence of a stop: `motor_disabled` is reached only through `confirmMotorDisable()`, which refuses unless feedback is valid and every joint has been observed still for the whole settle window. | `src/control_service.cpp`, `python/tests/test_dynamics.py` |
+| 11 | **Trajectories are refused, not clamped.** All waypoints are validated on upload (finiteness, timing, count, horizon, soft limits, velocity, acceleration) and the start transition is explicit; a rejection stores nothing and latches nothing. | `ControlService::validateTrajectoryLocked` |
+| 12 | **The state lock is never held across a backend call.** `runCycle` observes / decides / acts under two separate locks, so a backend that blocks (the pybind bridge calls into Python) cannot freeze status polling or an operator's stop request. | `include/r1_robot/control_service.hpp` |
 
 A pure **stop** command is always accepted — even in a failed state — so a fault
 can never block the way back to a safe state.
@@ -223,15 +226,23 @@ are patched in `<build>/sdk_patched` and the official checkout stays clean
 
 | Suite | Count | Command |
 |---|---|---|
-| C++ | 103 unit cases / 11 ctest suites (SDK build); 94 / 11 without the SDK | `ctest --test-dir build --output-on-failure` |
-| Python | 104 (2 more skip unless the bridge is built) | `cd python && python -m pytest -q` |
-| C++↔sim bridge (opt-in) | +2 (106 total) | build with `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON` |
+| C++ | 125 unit cases / 11 ctest suites (SDK build); 116 / 11 without the SDK | `ctest --test-dir build --output-on-failure` |
+| Python | 129 (sim + bridge suites skip when their dependencies are absent) | `cd python && python -m pytest -q` |
 
-Python simulation/dynamics tests skip automatically when MuJoCo or Pinocchio is
-not installed. The C++ suite is validated in CI both with the pinned SDK and with
-`-DR1_ROBOT_WITH_UNITREE_BACKEND=OFF` (mock only, warnings-as-errors). The
-pybind11 bridge tests skip in CI because the binding is off by default; they run
-only when it is built explicitly (see §4).
+Four CI jobs (`.github/workflows/ci.yml`): mock-only with warnings-as-errors,
+SDK-enabled with the submodule-cleanliness negative test, offline Python, and a
+MuJoCo-sim + bridge job that installs the `[sim]` extras and configures with
+`-DR1_ROBOT_BUILD_PYTHON_BINDING=ON`. That last job also asserts the binding is
+opt-in: a default configure must not even have the target.
+
+### Everything here is offline-verified only
+
+**No behaviour in this repository has been validated on a real R1.** Every
+guarantee below is demonstrated against `MockArm` / `MockJointBus` / MuJoCo, none
+against a serial port or a motor. Powering the arm still requires the staged
+procedure in `HARDWARE_BRINGUP.md`, and the open items are listed as
+`HARDWARE_UNVERIFIED` in `SAFETY_REVIEW.md`. CI being green is evidence about
+simulation, not about hardware.
 
 ### Simulation (MuJoCo + Pinocchio)
 
@@ -313,15 +324,15 @@ a fresh clone (or after `git submodule update --init --recursive`):
 #    enforces the submodule stays read-only, runs 11 ctest suites.
 cmake -S . -B build -DR1_ROBOT_WITH_UNITREE_BACKEND=ON -DR1_ROBOT_WARNINGS_AS_ERRORS=ON
 cmake --build build
-ctest --test-dir build --output-on-failure            # 103 cases, all pass
+ctest --test-dir build --output-on-failure            # 125 cases, all pass
 
 # 2. C++ WITHOUT the SDK (offline core only): proves ControlService, the motion
 #    gate and the snapshot tests need no vendor dependency.
 cmake -S . -B build-mock -DR1_ROBOT_WITH_UNITREE_BACKEND=OFF -DR1_ROBOT_WARNINGS_AS_ERRORS=ON
-cmake --build build-mock && ctest --test-dir build-mock  # 94 cases, all pass
+cmake --build build-mock && ctest --test-dir build-mock  # 116 cases, all pass
 
 # 3. Python: offline logic always runs; MuJoCo/Pinocchio suites skip when absent.
-cd python && python -m pytest -q                      # 104 passed
+cd python && python -m pytest -q                      # 129 passed
 
 # 4. The two headline demonstrations:
 ./build/tests/r1_robot_tests --filter control_service  # comm-loss -> fault latch -> refuse motion
@@ -335,7 +346,7 @@ cd python && python -m pytest tests/test_dynamics.py -k collision  # MuJoCo dete
 pip install pybind11 mujoco pinocchio
 cmake -S . -B build-bridge -DR1_ROBOT_BUILD_PYTHON_BINDING=ON
 cmake --build build-bridge
-cd python && python -m pytest tests/test_control_binding.py -q   # 2 passed
+cd python && python -m pytest tests/test_control_binding.py -q   # 14 passed
 ```
 
 The same three configurations run in CI (`.github/workflows/ci.yml`), including a
@@ -395,7 +406,7 @@ See `HARDWARE_BRINGUP.md` §7 for the full checklist. Summary:
 | Feedback values + reception evidence come from one atomic snapshot | `snapshot_atomic_all_joints_share_one_clock`, `snapshot_*` suite |
 | MuJoCo detects a designed collision scenario | `test_environment_mode_detects_a_designed_tabletop_collision`, `test_self_mode_nominal_is_clean_but_a_fold_is_detected` |
 | Opt-in pybind11 bridge: the production C++ `ControlService` drives the real MuJoCo plant and latches a fault on comm loss against the real monotonic clock | `python/tests/test_control_binding.py` (`test_cpp_service_drives_mujoco_then_survives_comm_loss`, requires `-DR1_ROBOT_BUILD_PYTHON_BINDING=ON`) |
-| 103 C++ + 104 Python tests pass (SDK build; 94 C++ without the SDK) | `ctest` / `pytest` |
+| 125 C++ + 129 Python tests pass (SDK build; 116 C++ without the SDK) | `ctest` / `pytest` |
 
 ### To be verified on real hardware (`TODO(bringup)` / 待验证)
 

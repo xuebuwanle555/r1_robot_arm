@@ -305,6 +305,82 @@ arithmetic).
 
 ---
 
+## 10. P0 review of the stop state machine, admission and loop reliability
+
+This round re-reviewed `ControlService` for the failure modes that a safety
+stack actually hits, and found four real defects. Each was reproduced by a test
+that failed against the previous code before it was fixed.
+
+**10a - the controlled stop dropped the drive on a timer (§A).**
+`kControlledStop` concluded from `|dq| < stop_vel_tol` **plus** `t -
+stop_engaged >= 500 ms` that it could `setMotionArmed(false)` and send mode 0.
+Both premises are wrong. Velocity is exactly zero at the instant a
+gravity-loaded arm begins to fall, so stillness is not evidence that removing
+torque is safe; and `connected == false` was mapped to "settled", i.e. losing the
+transport was reported as a completed stop. Now:
+
+* the stop holds under active FOC, open-ended;
+* `motor_disabled` is reachable only through `confirmMotorDisable()`, an explicit
+  operator call that refuses unless feedback is currently valid **and** every
+  joint has been observed still for the whole `stop_settle_ns` window without a
+  break (a lost-feedback or still-moving joint both withdraw prior verification);
+* `StopReason` separates operator stop / upper-layer timeout / feedback lost /
+  actuator fault / unsafe state, so "we stopped it" and "we can no longer see it"
+  are different facts downstream;
+* the hold target is the last **commanded** setpoint, never stale measured `q` —
+  re-aiming at feedback that just went bad would command a jump.
+
+MuJoCo evidence (`test_dynamics.py::TestGravityLoadAtDriveRemoval`): settled
+under FOC the arm sits at `max|dq| = 3.3e-6` rad/s; 0.3 s after mode 0 it is at
+`4.8` rad/s with J3 down **0.75 rad**. Stillness predicted nothing. Removing the
+drive remains `HARDWARE_UNVERIFIED` as a way to hold the arm — it is now
+disproved by test rather than only disclaimed in a comment.
+
+**10b - trajectories were admitted almost unchecked (§B).**
+`submitTrajectory`/`submitCommand` returned `void`; only the soft limits were
+examined, there was no finiteness, timing, count, horizon, velocity or
+acceleration check, and the buffered plan started at the first waypoint
+regardless of where the arm was (`last_target_` was overwritten with it, so the
+anti-step ramp could not smooth the jump). An out-of-limit destination *latched a
+fault and stopped the arm* for an upload that was never executed. Now both entry
+points return `SubmitResult{status, error, waypoint_index}`, full validation runs
+before anything is stored, a rejection latches nothing, and the start transition
+is a synthesized, velocity-limited **lead-in** that shifts the whole plan later
+rather than bending its timings — or is refused if it does not fit the budget.
+Submission is also refused while feedback is invalid, so nothing is ever planned
+off stale data.
+
+**10c - the loop drifted and swallowed send failures (§C).**
+`threadMain` slept the period *after* each cycle, so the real interval was
+`period + work`; `writeCommand()` returns `bool` and its result was discarded,
+making a frame that never reached the arm indistinguishable from one that did.
+Now scheduling is on absolute deadlines with rebase-on-miss (no catch-up burst),
+a failed send latches `bus.send_failed`, and persistent lateness latches
+`ctrl.deadline_missed` after `max_consecutive_overruns`. `ControlLoopMetrics`
+reports cycles, period, overruns, send failures, exec time, worst jitter and
+measured rate — **observations, not real-time guarantees**; a `std::thread` on a
+general-purpose kernel is not a hard real-time context and nothing here claims it
+is.
+
+**10d - the state lock was held across backend I/O (§C/§D).**
+`runCycle` took `mutex_` for the whole cycle including `readState()`/
+`writeCommand()`. For the pybind bridge those calls enter Python, so a Python
+that blocks would also have blocked `status()`, `latestState()` and the
+operator's `requestControlledStop()`. `mutex_` now guards state only and
+`io_mutex_` serialises the backend, never held simultaneously; `runCycle` is
+observe → decide → act. `TestIndependentWatchdog` proves the watchdog fires from
+the service's own thread with Python calling nothing at all — the synchronous
+`run_cycle()` tests could only ever show that the service reacts when Python
+agrees to schedule it.
+
+**Structural limit of the bridge, stated plainly.** Every cycle of a threaded
+bridge re-acquires the GIL to enter Python. If the main interpreter is stuck
+*while holding the GIL*, the C++ watchdog cannot run. That is why this binding is
+a validation instrument and must never be wired to a real arm; the hardware
+service needs a backend that does not depend on the Python interpreter yielding.
+
+---
+
 ## Open risks (`HARDWARE_UNVERIFIED`)
 
 1. **Realized joint gains.** `kp`/`kd` reach the wire divided by `ratio²` inside
@@ -343,3 +419,28 @@ arithmetic).
    any trajectory (`JOINT_MAPPING.md` §1).
 9. `SAFE_HOME` is simulation-validated only; cable routing, fixtures, brake
    behaviour and real self-collision are not covered (`JOINT_MAPPING.md` §2).
+10. **Drive removal after a verified stop is still unproven.** `confirmMotorDisable`
+    gates the decision on evidence, but whether mode 0 leaves an R1 arm holding
+    its pose under gravity is exactly the thing no test can answer here; the
+    MuJoCo result in §10a says it falls, and a real arm with brakes/cabling may
+    behave differently in either direction.
+11. **Admission thresholds are placeholders.** `max_joint_accel_rad_s2` (5.0),
+    `max_consecutive_overruns` (5), `traj_lead_in_max_ns` (5 s),
+    `stop_settle_ns` (500 ms) and `overrun_tolerance_ns` (period/2) are
+    engineering guesses. The velocity bound reuses the URDF `velocity` fields,
+    which are themselves unverified against the actuators (item 4).
+12. **The anti-step bound conflicts with a lagging plant.** `checkCommand`
+    compares command against *measured* position, so a plant that lags by more
+    than one `max_joint_step_rad` cannot be commanded forward at all — observed
+    directly while driving MuJoCo physics, and worked around in tests by
+    loosening the bound rather than by measuring a real value.
+13. **Real loop timing is unmeasured.** `ControlLoopMetrics` now makes rate,
+    exec time and jitter observable, but no figure in this repository comes from
+    a 6 Mbaud bus with a real `ArmMotorBus::step()` floor (≥805 µs per 7-joint
+    frame, §Timing above), so the achievable period is unknown.
+14. **Gripper model cannot be driven yet.** The combined prototype model loads
+    and its mimic compiles, but it declares no actuators (`nu = 0`) and its
+    massless frames — including `prototype_tcp` — are merged away at compile
+    time, so there is no addressable TCP body. Grasp-force claims are out of the
+    question until both are fixed; `effort = 8` in that URDF is not a measured
+    grasp force (`SIMULATION.md` §8, `python/r1_robot/gripper_model.py`).

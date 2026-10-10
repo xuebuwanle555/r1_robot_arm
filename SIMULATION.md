@@ -197,12 +197,12 @@ end-effector   : [0.0455, -0.0439, 0.2419] m
 ## 6. How to run the tests
 
 ```bash
-# C++ (103 cases / 11 ctest suites)
+# C++ (125 cases / 11 ctest suites)
 cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo
 cmake --build build -j"$(nproc)"
 ctest --test-dir build --output-on-failure
 
-# Python (104 tests; MuJoCo/Pinocchio tests skip if the extras are missing)
+# Python (129 tests; MuJoCo/Pinocchio suites skip if the extras are missing)
 cd python && python -m pytest -q
 ```
 
@@ -248,3 +248,39 @@ visual STL, so self-collision is conservative (see `SAFETY_REVIEW.md` open risk
    bridge now runs the production C++ `ControlService` against the real `SimArm`
    plant and exercises the watchdog against the real monotonic clock — see
    `python/tests/test_control_binding.py`.)*
+
+---
+
+## 8. Gripper-equipped prototype model (measured, not yet drivable)
+
+The combined arm + reBot gripper model is generated outside this repository at
+`assets/robots/r1_rebot_prototype/r1_rebot.urdf` (path overridable with
+`R1_GRIPPER_URDF`). `python/r1_robot/gripper_model.py` inventories it with the
+standard library only, and `tests/test_gripper_urdf.py` pins the structure. The
+asset is read in place and never modified; when it is absent the suite skips.
+
+Measured facts:
+
+| Property | Value |
+|---|---|
+| Tree | 13 links, 12 joints → **8 independent DOF** |
+| Arm section | J1..J7 revolute, limits identical to this repo's frozen model (asserted per joint) |
+| Fingers | `rebot_finger_left` 0…0.05 m, `rebot_finger_right` −0.05…0 m |
+| Coupling | right `mimic` left, multiplier −1 |
+| Meshes | 26 references, all resolving on this machine |
+| MuJoCo | `nq = nv = 9`; the mimic compiles to an `mjEQ_JOINT` equality over the two finger joints and closes numerically |
+
+Two blockers before any gripper experiment, both deferred to the gripper phase
+with deliberate intent:
+
+1. **`nu = 0`.** The URDF declares no transmissions or actuators, so the model
+   can be loaded and stepped but not commanded. A generated MJCF must add
+   actuators for the 8 independent DOF.
+2. **No TCP frame survives.** `prototype_tcp`, `prototype_adapter`,
+   `rebot_end_link` and `base_link` carry no inertia, so MuJoCo merges them into
+   their parents and `mj_name2id(..., 'prototype_tcp')` returns −1. The tool
+   center point the grasping work must address has to come back as a `<site>`.
+
+Nothing here is a grasp result: `effort = 8` in that URDF is not a measured
+grasp force, and the masses, adapter geometry and finger inertias are the source
+model's own stated assumptions.
