@@ -2,7 +2,12 @@
 
 Research control stack for the **Unitree R1-7A** 7-DOF robotic arm.
 
-> **Status: phase 1 (architecture + offline-testable driver abstraction).**
+> **Status: phase 1 (architecture + offline-testable driver abstraction), now
+> hardened through the P0/P1 safety review.** In addition to the phase-1 stack
+> this branch adds an unforgeable hardware control-permission boundary, a
+> standalone C++ `ControlService` (periodic thread, command watchdog, fault
+> latching), an atomic feedback snapshot, a real trajectory success predicate,
+> and working MuJoCo collision detection.
 > Phase 1 does not implement ROS2, MoveIt2, LeRobot, ACT, Diffusion Policy or
 > VLA training. It provides the foundation those will be built on.
 
@@ -29,6 +34,8 @@ These are enforced in code, not just in documentation:
 | 5 | **No automatic home / zero-torque / high-gain control.** `home()` returns `false` / raises; the only zero-torque path is an explicitly acknowledged `--probe` in `r1_arm_status`. | `src/r1_arm.cpp`, `examples/arm_status.cpp` |
 | 6 | **Unverifiable parameters are labelled, not guessed.** Search the tree for `TODO(bringup)` and `待验证`. | throughout |
 | 7 | **`stop()` is not a brake.** It sends mode 0 (motor output disabled) and *cannot* hold an arm loaded by gravity. | `HARDWARE_BRINGUP.md` §6 |
+| 8 | **The motion lock cannot be disarmed by ordinary business code.** `setMotionArmed()`/`probeFeedback()` require an unforgeable `MotionControl` token that only `R1Arm`/`ControlService` can mint (private ctor + friend); `R1Arm::backend()` returns a `const` read-only handle so actuating calls will not compile. | `include/r1_robot/motion_control.hpp`, `tests/test_hardware_gate.cpp` |
+| 9 | **Exactly one owner writes to the hardware bus.** `ControlService` owns the backend, runs the periodic loop and a command-timeout watchdog, latches faults (upper-layer silence / stale feedback / motor error) and never auto-re-arms after a timeout. | `src/control_service.cpp`, `tests/test_control_service.cpp` |
 
 A pure **stop** command is always accepted — even in a failed state — so a fault
 can never block the way back to a safe state.
@@ -215,11 +222,12 @@ are patched in `<build>/sdk_patched` and the official checkout stays clean
 
 | Suite | Count | Command |
 |---|---|---|
-| C++ | 85 | `ctest --test-dir build --output-on-failure` |
-| Python | 97 | `cd python && python -m pytest -q` |
+| C++ | 103 unit cases / 11 ctest suites (SDK build); 94 / 11 without the SDK | `ctest --test-dir build --output-on-failure` |
+| Python | 103 | `cd python && python -m pytest -q` |
 
 Python simulation/dynamics tests skip automatically when MuJoCo or Pinocchio is
-not installed.
+not installed. The C++ suite is validated in CI both with the pinned SDK and with
+`-DR1_ROBOT_WITH_UNITREE_BACKEND=OFF` (mock only, warnings-as-errors).
 
 ### Simulation (MuJoCo + Pinocchio)
 
@@ -236,9 +244,10 @@ backend-bypass and per-joint feedback holes it found and fixed, and the open
 
 ```bash
 cd build
-ctest --output-on-failure      # 7 suites
+ctest --output-on-failure      # 11 suites
 ./tests/r1_robot_tests --list  # every case
-./tests/r1_robot_tests --filter safety
+./tests/r1_robot_tests --filter control_service
+./tests/r1_robot_tests --filter motion_gate
 ```
 
 ---
@@ -290,6 +299,35 @@ python -m pytest -q                                   # or:
 python -m unittest discover -s tests -t .
 ```
 
+### Reproduce everything offline (deterministic, no hardware, no network)
+
+Every safety-critical behaviour on this branch is verifiable without an arm. From
+a fresh clone (or after `git submodule update --init --recursive`):
+
+```bash
+# 1. C++ WITH the pinned SDK: compiles the real backend + the patched SDK copy,
+#    enforces the submodule stays read-only, runs 11 ctest suites.
+cmake -S . -B build -DR1_ROBOT_WITH_UNITREE_BACKEND=ON -DR1_ROBOT_WARNINGS_AS_ERRORS=ON
+cmake --build build
+ctest --test-dir build --output-on-failure            # 103 cases, all pass
+
+# 2. C++ WITHOUT the SDK (offline core only): proves ControlService, the motion
+#    gate and the snapshot tests need no vendor dependency.
+cmake -S . -B build-mock -DR1_ROBOT_WITH_UNITREE_BACKEND=OFF -DR1_ROBOT_WARNINGS_AS_ERRORS=ON
+cmake --build build-mock && ctest --test-dir build-mock  # 94 cases, all pass
+
+# 3. Python: offline logic always runs; MuJoCo/Pinocchio suites skip when absent.
+cd python && python -m pytest -q                      # 103 passed
+
+# 4. The two headline demonstrations:
+./build/tests/r1_robot_tests --filter control_service  # comm-loss -> fault latch -> refuse motion
+./build/tests/r1_robot_tests --filter motion_gate      # bypass attempts are refused
+cd python && python -m pytest tests/test_dynamics.py -k collision  # MuJoCo detects a designed collision
+```
+
+The same three configurations run in CI (`.github/workflows/ci.yml`), including a
+negative test that a stray file written into the SDK checkout fails the build.
+
 ---
 
 ## 5. Design rules
@@ -299,8 +337,15 @@ python -m unittest discover -s tests -t .
   frame (`dir * scale * motor + offset`) never leaves the C++ hardware backend.
 * **The backend is a dumb I/O adapter.** It does not validate commands and does
   not decide what may move.
-* **`R1Arm` is the single choke point** for validation, motion gating and
-  emergency stop. Upper layers (phase 2+) talk to `R1Arm` only.
+* **`R1Arm` is the choke point for the single-shot command path.** It owns
+  validation, motion gating and emergency stop, and hands out only a `const`
+  read-only backend handle.
+* **`ControlService` owns the periodic, real-time write path.** For continuous
+  operation there is exactly one owner of the hardware bus: a `ControlService`
+  that runs its own thread, applies the command-timeout watchdog, latches faults
+  and buffers trajectories. Upper layers (Python / VLA) submit setpoints and
+  heartbeats to it; they never touch the backend. Arming either entry point needs
+  the unforgeable `MotionControl` token.
 * **Python does not own the real-time loop.** It is for planning, datasets,
   policy inference and analysis. The single documented bridge is a pybind11
   module or a ROS2/ZMQ service in front of the C++ `R1Arm` (phase 3), keeping
@@ -328,15 +373,22 @@ See `HARDWARE_BRINGUP.md` §7 for the full checklist. Summary:
 | Real hardware refused without the master switch | `r1_arm_refuses_a_real_backend_without_the_master_switch` |
 | `R1Arm` never sends a command that did not pass the envelope | `r1_arm_still_validates_commands_after_enabling` |
 | MockArm is deterministic and offline | 11 mock tests, no sleeps, no wall-clock dependence |
-| The build compiles the official `arm_motor_bus.cpp` unchanged | `r1_robot_unitree_backend` target |
-| 67 C++ + 33 Python tests pass | `ctest` / `unittest` |
+| Motion-lock bypass is closed at compile time (not by convention) | `r1_arm_backend_handle_is_read_only`, `enabled_gate_still_bypasses_safety_via_writecommand_so_backend_is_hidden`, `feedback_probe_does_not_arm_motion` |
+| `ControlService` watchdog latches on upper-layer silence and never auto-re-arms | `control_service_watchdog_latches_on_silence_then_refuses_motion` (+ stale-feedback / motor-error / port-drop variants) |
+| Feedback values + reception evidence come from one atomic snapshot | `snapshot_atomic_all_joints_share_one_clock`, `snapshot_*` suite |
+| MuJoCo detects a designed collision scenario | `test_environment_mode_detects_a_designed_tabletop_collision`, `test_self_mode_nominal_is_clean_but_a_fold_is_detected` |
+| 103 C++ + 103 Python tests pass (SDK build; 94 C++ without the SDK) | `ctest` / `pytest` |
 
 ### To be verified on real hardware (`TODO(bringup)` / 待验证)
 
 * Real bus voltage and the correct `min_supply_voltage` floor.
-* Achievable control rate, feedback latency and a realistic `max_feedback_age_s`
-  (the SDK does not expose a per-frame reception timestamp — `UnitreeArmBackend`
-  stamps at read time).
+* Real achievable control rate, feedback latency and a realistic
+  `max_feedback_age_s` on the 6 Mbaud bus. The patched SDK now reports per-frame
+  reception time via `feedbackSnapshot()` and `UnitreeArmBackend` stamps states at
+  the **reception** time (not read time); the accuracy of that reception clock vs.
+  the real bus still needs hardware confirmation (`HARDWARE_UNVERIFIED`).
+* Real timing of the `ControlService` periodic loop and the command-timeout
+  watchdog under a genuinely stalled Python/VLA process.
 * Whether `timed_out` should be `true` or `false` for each application.
 * Actual torque/velocity capability vs. the URDF `effort`/`velocity` attributes.
 * Sign of each joint under gravity (needed before any gravity-holding control).
@@ -355,7 +407,8 @@ See `HARDWARE_BRINGUP.md` §7 for the full checklist. Summary:
 | Phase | Content |
 |---|---|
 | **1 (done)** | Architecture, `R1Arm`, safety framework, `MockArm`, gripper interface, C++ + Python APIs, tests, docs |
-| 2 | Hardware bring-up; model layer (Pinocchio, MuJoCo); gravity compensation; joint-space trajectories with feed-forward |
+| **1.5 (done, this branch)** | P0 hardware control-permission boundary (unforgeable `MotionControl`), standalone C++ `ControlService` (periodic loop, watchdog, fault latch), atomic feedback snapshot (`feedbackSnapshot()` patch v2), real trajectory success predicate, working MuJoCo collision detection, CI + license |
+| 2 | Hardware bring-up; gravity compensation; joint-space trajectories with feed-forward on the real arm |
 | 3 | Real-time bridge (pybind11 or ROS2/ZMQ) so Python can command the C++ `R1Arm` without owning the loop |
 | 4 | ROS2 + MoveIt2, URDF/mesh integration, camera drivers (D435, Astra Pro) |
 | 5 | LeRobot datasets, ACT, Diffusion Policy, π₀/π₀.₅ evaluation |
@@ -371,5 +424,8 @@ See `HARDWARE_BRINGUP.md` §7 for the full checklist. Summary:
 
 ## License
 
-MIT for this project. The vendored official SDK keeps its own license; see the
-SDK repository.
+MIT for this project (see [`LICENSE`](LICENSE)). The vendored official SDK keeps
+its own BSD-3-Clause license and the required attribution is reproduced in
+[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md), along with the open
+(`NOASSERTION`) license questions for the prebuilt `motor_controller` library and
+the URDF/STEP/STL design assets.

@@ -219,18 +219,26 @@ python -m pip install --user "mujoco>=3.0" "pin>=2.6"
 
 Done in this round: URDF + model inspection, Pinocchio FK/Jacobian with
 numerical validation, MuJoCo model generation + cross-validation, `SimArm`,
-minimum-jerk trajectories with outcome classification, headless viewer.
+minimum-jerk trajectories with a real success predicate (position + velocity +
+sustained dwell), headless viewer, **authored collision modes** (`none` /
+`environment` / `self`) with a validated tabletop + self-collision scenario,
+actuator-saturation and joint-limit checks, and a **dynamics-parameter
+provenance** map (`dynamics_provenance()`).
 
 Not done (deliberately): no ROS2 / MoveIt2 / LeRobot, no VLA, no real-arm
-motion, no contact-rich manipulation, no model-based controller beyond the
-gravity feed-forward. Suggested phase-2 work:
+motion, no contact-rich *manipulation* policy, no model-based controller beyond
+the gravity feed-forward. Collision geometry is the convex hull of each concave
+visual STL, so self-collision is conservative (see `SAFETY_REVIEW.md` open risk
+#7). Suggested phase-2 work:
 
 1. **Task-space servo**: use `R1Kinematics.jacobian` for Cartesian impedance /
    resolved-rate control, with the same safety envelope.
 2. **Dynamics**: validate `gravity_torques` against MuJoCo `qfrc_bias`, then add
-   Coriolis + inertia-based computed-torque control.
-3. **Contact**: enable collision geoms, add the gripper, and validate grasp
-   models against the DM4310 gripper limits.
+   Coriolis + inertia-based computed-torque control; identify real
+   damping/armature/friction (currently simulation assumptions tagged
+   `HARDWARE_UNVERIFIED`).
+3. **Better collision meshes**: replace hulls with fitted primitives or convex
+   decomposition before trusting self-collision for tight-clearance planning.
 4. **Trajectory polish**: time-scaling to satisfy `max_velocity`/`max_accel`
    from the URDF, and Cartesian waypoints interpolated in task space.
 5. **Hardware parity**: replay recorded SimArm poses through the C++ stack and

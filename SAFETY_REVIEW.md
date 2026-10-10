@@ -13,15 +13,16 @@ No safety check was removed or weakened to make anything pass.
 
 | # | Question | Verdict |
 |---|----------|---------|
-| 1 | Can a motion command bypass `SafetyMonitor`? | **2 holes found → fixed** |
+| 1 | Can a motion command bypass `SafetyMonitor`? | **2 holes found → fixed**; further closed this round (§1c) |
 | 2 | Do calibration / direction / gearing / Kp-Kd-tau units match the SDK? | Mapping verified; realized gains `HARDWARE_UNVERIFIED` |
-| 3 | Can state feedback be stale? Timestamps & thread safety? | **Real gap → fixed** (documented SDK patch); R1Arm race **fixed** |
-| 4 | Does the low-level controller watchdog on its own? | Yes by design; timing `HARDWARE_UNVERIFIED` |
-| 5 | Are stop / FOC-hold / zero-torque / disable conflated? | No; distinguished + tested |
-| 6 | Are trajectory timeout / not-reached / motor-fault detected? | Added + tested |
-| 7 | Does the read-only diagnostic tool change motor modes? | No (only an explicit, twice-confirmed `--probe`) |
-| 8 | Can the "no real hardware by default" rule be bypassed via the backend? | Yes before → **fixed** (backend-level gate) |
+| 3 | Can state feedback be stale? Timestamps & thread safety? | **Real gap → fixed**; now an atomic `feedbackSnapshot()` (value+evidence under one lock, one clock); R1Arm race **fixed** |
+| 4 | Does the low-level controller watchdog on its own? | **`ControlService` added**: periodic thread + command-timeout watchdog + fault latch; timing `HARDWARE_UNVERIFIED` |
+| 5 | Are stop / FOC-hold / zero-torque / disable conflated? | No; distinguished + tested, now incl. software-hold / controlled-stop / motor-disabled |
+| 6 | Are trajectory timeout / not-reached / motor-fault detected? | **Strengthened**: REACHED needs position + velocity + sustained dwell; timeout can no longer grant REACHED |
+| 7 | Does the read-only diagnostic tool change motor modes? | No — `probeFeedback` now needs the `MotionControl` token via `R1Arm` |
+| 8 | Can the "no real hardware by default" rule be bypassed via the backend? | Yes before → fixed (backend gate) → **this round: arming/probing needs an unforgeable token; `backend()` is `const`** |
 | 9 | Can Python drive real hardware? Where does safety authority live? | No Python hardware path; authority is C++; **guarded by a test** |
+| 10 | Can the simulator confirm the arm stops at / collides with obstacles? | **Fixed**: collisions were a silent no-op; environment + self modes now authored in XML and tested |
 
 ---
 
@@ -64,16 +65,39 @@ actuating joint (`kp > 0`) without valid feedback, independent of
 `require_all_joints_valid`. Regression test
 `safety_rejects_actuation_for_a_joint_without_feedback` fails without the fix.
 
-### 1c. Remaining, by design
+### 1c. probeFeedback and the backend handle (found, fixed this round)
 
-* `UnitreeArmBackend::probeFeedback()` is callable directly. It sends **one
-  zero-torque FOC frame** per joint (compliant, bridges powered) and is the
-  lowest-energy way to wake up feedback. It is never automatic and is documented
-  as a deliberate manual step (`HARDWARE_BRINGUP.md` §2). It is *not* gated by
-  `MotionGate` because arming it through `R1Arm` would require enabling motion —
-  which is a larger hazard than the probe itself.
-* A stop command is accepted in every state, on purpose: a fault must never
-  block the way back to a safe state.
+Earlier this review accepted two things "by design" that this round closes, per
+the request that the control-permission boundary must not rely on convention:
+
+* `UnitreeArmBackend::probeFeedback()` used to be callable directly on the
+  concrete backend and bypassed `MotionGate`. It now takes an unforgeable
+  `MotionControl` token and is reachable only through
+  `R1Arm::probeFeedbackForBringup(human_confirmed, …)`, which additionally
+  requires `allow_real_hardware` for a real backend. Ordinary business code
+  cannot construct the token, so it cannot power the motor bridges.
+* `R1Arm::backend()` used to hand out a writable `ArmBackendPtr`; a caller could
+  invoke `setMotionArmed(true)` on it. It now returns
+  `std::shared_ptr<const IArmBackend>`, so `writeCommand` / `stop` /
+  `setMotionArmed` / `probeFeedback` (all non-const) are ill-formed through it —
+  a read-only status handle by construction. Arming needs the token; the token's
+  only constructor is private and befriends `R1Arm` and `ControlService`.
+
+Negative regressions: `r1_arm_backend_handle_is_read_only`,
+`enabled_gate_still_bypasses_safety_via_writecommand_so_backend_is_hidden`,
+`feedback_probe_does_not_arm_motion`, `enable_motion_is_the_only_armed_transition`
+(`tests/test_hardware_gate.cpp`).
+
+### 1d. Still accepted by design
+
+* A pure **stop** command is accepted in every state, on purpose: a fault must
+  never block the way back to a safe state. It only removes energy.
+* With motion enabled the backend gate is armed, so a caller who *somehow* holds
+  a non-const backend could push an out-of-envelope frame past `SafetyMonitor`
+  via `writeCommand`. This is the hole §1c's `const` handle closes: `R1Arm`
+  no longer exposes a writable backend, and `ControlService` never exposes one at
+  all (it is the sole owner). The regression documents the residual hazard so the
+  handle contract cannot quietly regress.
 
 ---
 
@@ -289,10 +313,22 @@ arithmetic).
 6. **Voltage/temperature** are parsed by `MotorProtocol` but dropped by
    `ArmMotorBus`, so the undervoltage check is inert on real hardware (only motor
    error bit `0x8` is usable). Closing this needs a further SDK patch.
-7. **Self-collision is not validated.** Deeply folded poses of this URDF produce
-   **no** self-contact in MuJoCo, so collision limits could not be exercised;
-   mirrored in `test_dynamics.py::test_no_self_collision_is_detected_in_folded_poses`.
-8. Soft-limit zero pose: J2/J4 cannot be commanded to `q = 0` under the default
-   margin — a constraint to respect in any trajectory (`JOINT_MAPPING.md` §1).
+7. **Self-collision is now detectable but only approximately.** This round found
+   the earlier "no self-contact in MuJoCo" result was an artifact: the old
+   `enable_collision` wrote `geom_contype` *after* the model compiled, which is a
+   silent no-op in MuJoCo 3.x. Collision masks are now authored in the generated
+   XML, and `test_dynamics.py::test_runtime_mask_write_does_not_enable_contacts`
+   pins that fact. `environment` mode reliably detects a designed tabletop/floor
+   collision; `self` mode detects a real fold (wrist across the upper arm) after
+   excluding the jointless/adjacent pairs and the one concentric `Link5↔Link7`
+   convex-hull artifact. Caveat: the collision geometry is the **convex hull of
+   each concave visual STL**, so self-collision is conservative — it can
+   over-report near-adjacent links and miss thin interpenetrations. Dedicated
+   primitive collision meshes would be needed for a tight guarantee.
+8. Soft-limit zero pose: J2/J4 lower limits are `0`, so under the default
+   `soft_limit_margin` a commanded `q = 0` is *outside* the soft range and is
+   rejected. Trajectory/hold tests must start from an in-range pose (the C++
+   `ControlService` tests park every joint at 0.1 rad). Constraint to respect in
+   any trajectory (`JOINT_MAPPING.md` §1).
 9. `SAFE_HOME` is simulation-validated only; cable routing, fixtures, brake
    behaviour and real self-collision are not covered (`JOINT_MAPPING.md` §2).
