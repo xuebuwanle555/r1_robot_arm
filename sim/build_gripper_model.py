@@ -30,6 +30,17 @@ def main() -> int:
     ap.add_argument("--collision-mode", default="environment",
                     choices=("none", "environment", "self"))
     ap.add_argument("--no-table", action="store_true")
+    ap.add_argument("--table-top-z", type=float, default=None,
+                    help="height of the work surface; default is the scene "
+                         "constant TABLE_TOP_Z_M in r1_robot.gripper_mjcf")
+    ap.add_argument("--robot-base-z", type=float, default=None,
+                    help="how high the arm base sits off the floor; default is "
+                         "the scene constant ROBOT_BASE_Z_M")
+    ap.add_argument("--collision-shape", default="box", choices=("box", "mesh"),
+                    help="box = oriented boxes fitted to each CAD collision "
+                         "mesh (default; MuJoCo turns the raw meshes into "
+                         "bounding spheres, which cannot show grasp geometry). "
+                         "mesh = keep the mesh geoms and see what compiles")
     ap.add_argument("--gripper-kp", type=float, default=None)
     ap.add_argument("--gripper-force-limit-n", type=float, default=None)
     ap.add_argument("--show-provenance", action="store_true")
@@ -40,7 +51,13 @@ def main() -> int:
             print(f"  {k:38s} {v}")
         return 0
 
-    kwargs = {"collision_mode": a.collision_mode, "add_table": not a.no_table}
+    kwargs = {"collision_mode": a.collision_mode,
+              "collision_shape": a.collision_shape,
+              "add_table": not a.no_table}
+    if a.table_top_z is not None:
+        kwargs["table_top_z"] = a.table_top_z
+    if a.robot_base_z is not None:
+        kwargs["robot_base_z"] = a.robot_base_z
     if a.gripper_kp is not None:
         kwargs["gripper_kp"] = a.gripper_kp
     if a.gripper_force_limit_n is not None:

@@ -138,6 +138,8 @@ class TestGeneratedGripperModel(unittest.TestCase):
         shared = []
         for i in range(self.m.nbody):
             n = mujoco.mj_id2name(self.m, mujoco.mjtObj.mjOBJ_BODY, i)
+            if i == 0:
+                continue          # the world body: a frame, not part of the robot
             if n and mujoco.mj_name2id(ref, mujoco.mjtObj.mjOBJ_BODY, n) >= 0:
                 shared.append(n)
         self.assertGreaterEqual(len(shared), 8,
@@ -151,11 +153,20 @@ class TestGeneratedGripperModel(unittest.TestCase):
                 rd.qpos[ref_adr[name]] = v
             mujoco.mj_forward(self.m, self.d)
             mujoco.mj_forward(ref, rd)
+            # The scene stands the arm on a deck (ROBOT_BASE_Z_M); the compiler
+            # leaves it at the origin.  Relative geometry is what must agree, so
+            # each side is measured from its own arm base - the link J1 hangs off.
+            def base_of(model, data):
+                jid = mujoco.mj_name2id(model, mujoco.mjtObj.mjOBJ_JOINT, "J1")
+                return data.xpos[int(model.body_parentid[model.jnt_bodyid[jid]])]
+
+            base = base_of(self.m, self.d)
+            ref_base = base_of(ref, rd)
             for b in shared:
                 im = self._body_ids(self.m, b)
                 ir = self._body_ids(ref, b)
-                worst = max(worst, float(np.max(np.abs(self.d.xpos[im] -
-                                                       rd.xpos[ir]))))
+                worst = max(worst, float(np.max(np.abs(
+                    (self.d.xpos[im] - base) - (rd.xpos[ir] - ref_base)))))
         self.assertLess(worst, 1e-9,
                         f"conversion drifted from the URDF compiler by {worst:g} m")
 

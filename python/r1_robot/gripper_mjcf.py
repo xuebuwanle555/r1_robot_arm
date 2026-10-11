@@ -73,14 +73,8 @@ def mesh_sources(gripper_urdf: Path | None = None) -> MeshSources:
 
 
 # -- rotation bookkeeping ----------------------------------------------------
-def rpy_to_quat(rpy) -> tuple[float, float, float, float]:
-    """URDF rpy -> MuJoCo quat (w x y z).
-
-    URDF defines R = Rz(yaw) @ Ry(pitch) @ Rx(roll).  Implementing the documented
-    product rather than guessing at Euler conventions is what keeps the gripper
-    pointing the right way; `tests/test_gripper_model.py` cross-checks the whole
-    tree against MuJoCo's own URDF compiler.
-    """
+def _rpy_matrix(rpy) -> list[list[float]]:
+    """URDF rpy (R = Rz @ Ry @ Rx) as a 3x3 matrix."""
     roll, pitch, yaw = (float(v) for v in rpy)
 
     def axis_matrix(angle, which):
@@ -95,8 +89,19 @@ def rpy_to_quat(rpy) -> tuple[float, float, float, float]:
         return [[sum(a[i][k] * b[k][j] for k in range(3)) for j in range(3)]
                 for i in range(3)]
 
-    r = matmul(matmul(axis_matrix(yaw, "z"), axis_matrix(pitch, "y")),
-               axis_matrix(roll, "x"))
+    return matmul(matmul(axis_matrix(yaw, "z"), axis_matrix(pitch, "y")),
+                  axis_matrix(roll, "x"))
+
+
+def rpy_to_quat(rpy) -> tuple[float, float, float, float]:
+    """URDF rpy -> MuJoCo quat (w x y z).
+
+    URDF defines R = Rz(yaw) @ Ry(pitch) @ Rx(roll).  Implementing the documented
+    product rather than guessing at Euler conventions is what keeps the gripper
+    pointing the right way; `tests/test_gripper_model.py` cross-checks the whole
+    tree against MuJoCo's own URDF compiler.
+    """
+    r = _rpy_matrix(rpy)
     trace = r[0][0] + r[1][1] + r[2][2]
     if trace > 0.0:
         s = math.sqrt(trace + 1.0) * 2.0
@@ -141,6 +146,12 @@ GRIPPER_PROVENANCE: dict[str, str] = {
     "arm joint limits": "official URDF (CAD)",
     "finger joint limits (+-50 mm)": "prototype URDF (CAD travel)",
     "finger mimic coefficient -1": "prototype URDF (CAD)",
+    "robot base height above the floor": "SCENE CHOICE - ROBOT_BASE_Z_M; the "
+                                        "prototype URDF has no platform geometry, "
+                                        "and the real deck height is "
+                                        "HARDWARE_UNVERIFIED",
+    "work surface height": "SCENE CHOICE - TABLE_TOP_Z_M, set by the arm's "
+                           "measured top-down workspace band, not by CAD",
     "link masses / inertials": "prototype URDF (author-stated estimates)",
     "mount origin + rpy on Link7": "prototype URDF (v3 side mount, CAD-derived)",
     "armature 0.01 per joint": "simulation assumption (numerical conditioning)",
@@ -150,6 +161,10 @@ GRIPPER_PROVENANCE: dict[str, str] = {
                                       "fingertip grasp force",
     "fingertip friction 0.9/0.6": "simulation assumption - rubber pads unmeasured",
     "solimp/solref contact": "simulation assumption - contact stiffness unknown",
+    "collision proxies": "approximation - boxes fitted to each CAD collision "
+                         "mesh's own axis-aligned bounds, because MuJoCo replaces "
+                         "these non-convex meshes with bounding spheres; not CAD "
+                         "surfaces, and not a clearance certificate",
     "object mass / size": "experiment assumption (fixture design, not CAD)",
     "site (TCP/fingertip) offsets": "derived from CAD geometry at generation time",
 }
@@ -395,6 +410,42 @@ GRIPPER_MAX_FORCE_N = 8.0
 #: Half-travel of the driven (left) finger, from the prototype URDF joint limit.
 FINGER_TRAVEL_M = 0.05
 
+#: Where the arm's own base plate sits in the world.  SCENE CHOICE, and the
+#: number is what the geometry asks for rather than a guess: the prototype URDF
+#: models the 7-joint arm and its gripper only - no platform, no torso - so the
+#: MJCF has to say how high that arm is off the floor before a work surface can
+#: mean anything.  Measured over 60k in-limit configurations, the fingertip plane
+#: pointed within 25 deg of vertical sits at z = -0.24 m to +0.33 m RELATIVE to
+#: the base, with the bulk of it between -0.16 m and +0.23 m at 0.25-0.35 m of
+#: horizontal reach.  A bench top therefore has to land near the base height, and
+#: 0.75 m puts it at a height a floor-standing R1 can work at without folding
+#: every joint against its limit.  HARDWARE_UNVERIFIED: the real deck height is a
+#: platform property this repository has no measurement of.
+ROBOT_BASE_Z_M = 0.75
+
+#: The work surface the arm reaches over.  A scene choice, not CAD, and both
+#: numbers in it are measurements of this model rather than a picture of a lab:
+#: sampling 100k in-limit arm configurations and keeping those whose tool points
+#: within 25 deg of vertical AND whose posture respects the 0.05 rad soft margin
+#: puts the fingertip plane between 0.58 and 0.95 m in world coordinates (median
+#: 0.75), while the gripper's own collision envelope reaches 52 mm PAST its
+#: fingertip sites - measured by `GripperScene.robot_dip_below_tip_m`.  So the
+#: surface has to be below the reach band by more than that protrusion: at 0.70 m,
+#: a 120 mm object presents its gripping plane at 0.80 m, the tool's lowest point
+#: lands 48 mm above the surface, and the arm is inside its comfortable band.  Put
+#: the surface at 0.76 m instead and every candidate pose penetrates it by 27-36 mm
+#: before the pads reach anything.  `tests/test_gripper_pick_place.py` asserts both
+#: the accepted band and the rejected low-clearance case.
+TABLE_TOP_Z_M = 0.70
+#: Half-extent of the slab.  The near edge matters more than the size: with the
+#: base at the world origin, the elbow links sweep x < 0.10 at table height, so a
+#: slab starting at x = 0.10 is hit by Link4/Link5 long before the fingers reach
+#: anything on it.  Starting at 0.30 leaves the elbow clear of the surface.
+TABLE_HALF_XY_M = (0.35, 0.35)
+TABLE_HALF_THICKNESS_M = 0.02
+#: Centre of the slab, from its top surface down.
+TABLE_CENTRE_X_M = 0.45
+
 def _principal_inertia(I):
     """URDF's full 3x3 inertia tensor -> (principal values, rotating quat).
 
@@ -470,6 +521,36 @@ def _link_frame_aabb(link, staged) -> tuple[tuple, tuple] | None:
     return tuple(lo), tuple(hi)
 
 
+def _collision_box_fit(shape, staged):
+    """Box that hugs a CAD collision mesh, as (centre, half-extents) in its frame.
+
+    MuJoCo cannot collide against these meshes: the prototype's STL collision
+    geometries are non-convex, and the compiler silently replaces such a mesh
+    with its *bounding sphere* - measured on this model, every arm link and every
+    finger became a single sphere, the gripper base a 38 mm one sticking 91 mm out
+    of its link.  A sphere that big straddles the fingertip plane, so neither
+    grasp clearance nor table clearance could be trusted.  Axis-aligned bounds per
+    collision element, rotated by that element's own rpy, reproduce the CAD
+    envelope closely enough to measure contact geometry, and cost nothing to
+    compile.  Primitives are returned untouched; a mesh whose stage is missing is
+    reported rather than guessed at.
+    """
+    if shape[0] != "mesh":
+        return None
+    ref = staged.get(shape[1])
+    if ref is None:
+        raise KeyError(f"mesh {shape[1]!r} was not staged")
+    lo, hi = stl_aabb(ref.source)
+    scale = shape[2] or (1.0, 1.0, 1.0)
+    lo = tuple(lo[k] * scale[k] for k in range(3))
+    hi = tuple(hi[k] * scale[k] for k in range(3))
+    centre = tuple(0.5 * (lo[k] + hi[k]) for k in range(3))
+    # A box needs non-zero thickness in every direction; sheet-like exports can
+    # measure ~0 along one axis.
+    half = tuple(max(0.5 * (hi[k] - lo[k]), 1e-4) for k in range(3))
+    return centre, half
+
+
 def fingertip_sites(links, staged, left_name, right_name):
     """Sites at the distal inner corner of each finger pad, from measured AABBs.
 
@@ -518,7 +599,7 @@ class ObjectSpec:
 
 
 def _emit_body(link, joints_by_parent, links, staged, mesh_names, *,
-               collision_mode, finger_sites, extra_sites):
+               collision_mode, collision_shape, finger_sites, extra_sites):
     b = ET.Element("body")
     b.set("name", link.name)
     if link.mass > 0.0:
@@ -547,9 +628,22 @@ def _emit_body(link, joints_by_parent, links, staged, mesh_names, *,
         g.set("quat", _fmt(rpy_to_quat(v["rpy"])))
         b.append(g)
     for c in link.collisions:
-        g = _geom_element(c["shape"], klass="collision", staged=staged,
-                          mesh_names=mesh_names)
-        g.set("pos", _fmt(c["origin"]))
+        fit = (_collision_box_fit(c["shape"], staged)
+               if collision_shape == "box" else None)
+        if fit is None:
+            g = _geom_element(c["shape"], klass="collision", staged=staged,
+                              mesh_names=mesh_names)
+            g.set("pos", _fmt(c["origin"]))
+        else:
+            centre, half = fit
+            rot = _rpy_matrix(c["rpy"])
+            pos = tuple(c["origin"][k]
+                        + sum(rot[k][j] * centre[j] for j in range(3))
+                        for k in range(3))
+            g = _geom_element(("box", tuple(2.0 * h for h in half)),
+                              klass="collision", staged=staged,
+                              mesh_names=mesh_names)
+            g.set("pos", _fmt(pos))
         g.set("quat", _fmt(rpy_to_quat(c["rpy"])))
         b.append(g)
 
@@ -574,6 +668,7 @@ def _emit_body(link, joints_by_parent, links, staged, mesh_names, *,
     for j in joints_by_parent.get(link.name, []):
         child = _emit_body(links[j.child], joints_by_parent, links, staged,
                            mesh_names, collision_mode=collision_mode,
+                           collision_shape=collision_shape,
                            finger_sites=finger_sites, extra_sites=extra_sites)
         child.set("pos", _fmt(j.origin_xyz))
         child.set("quat", _fmt(rpy_to_quat(j.origin_rpy)))
@@ -658,7 +753,10 @@ def adjacent_excludes(joints, root_name):
 def generate_gripper_mjcf(*,
                           gripper_urdf: Path | None = None,
                           collision_mode: str = "environment",
+                          collision_shape: str = "box",
                           add_table: bool = True,
+                          table_top_z: float = TABLE_TOP_Z_M,
+                          robot_base_z: float = ROBOT_BASE_Z_M,
                           objects: list[ObjectSpec] | None = None,
                           target_zone: tuple | None = None,
                           meshdir: str | None = None,
@@ -679,6 +777,8 @@ def generate_gripper_mjcf(*,
     """
     if collision_mode not in ("none", "environment", "self"):
         raise ValueError(f"unknown collision_mode {collision_mode!r}")
+    if collision_shape not in ("box", "mesh"):
+        raise ValueError(f"unknown collision_shape {collision_shape!r}")
 
     if meshdir is None:
         # Relative to where the model is written, so the file opens from any
@@ -798,10 +898,14 @@ def generate_gripper_mjcf(*,
                                   "conaffinity": "1", "condim": "4",
                                   "friction": "1 0.005 0.0001"})
     if add_table:
-        ET.SubElement(world, "geom", {"name": "tabletop", "type": "box",
-                                      "pos": "0.45 0 0.2", "size": "0.35 0.35 0.02",
-                                      "contype": "2", "conaffinity": "1",
-                                      "rgba": "0.55 0.42 0.25 1", "mass": "0"})
+        hx, hy = TABLE_HALF_XY_M
+        ET.SubElement(world, "geom", {
+            "name": "tabletop", "type": "box",
+            "pos": _fmt((TABLE_CENTRE_X_M, 0.0,
+                         table_top_z - TABLE_HALF_THICKNESS_M)),
+            "size": _fmt((hx, hy, TABLE_HALF_THICKNESS_M)),
+            "contype": "2", "conaffinity": "1",
+            "rgba": "0.55 0.42 0.25 1", "mass": "0"})
     for obj in objects or []:
         ob = ET.SubElement(world, "body", {"name": obj.name,
                                            "pos": _fmt(obj.pos)})
@@ -822,7 +926,12 @@ def generate_gripper_mjcf(*,
 
     robot = _emit_body(links[roots[0]], joints_by_parent, links, staged,
                        mesh_names, collision_mode=collision_mode,
+                       collision_shape=collision_shape,
                        finger_sites=tip_sites, extra_sites=extra_sites)
+    # The arm alone is what the URDF models; how high it stands off the floor is
+    # the scene's decision, and the work surface height only means anything once
+    # it is made (see ROBOT_BASE_Z_M).
+    robot.set("pos", _fmt((0.0, 0.0, robot_base_z)))
     world.append(robot)
 
     assets = ET.Element("asset")
@@ -833,7 +942,11 @@ def generate_gripper_mjcf(*,
     mujoco.insert(list(mujoco).index(asset) + 1, assets)
     mujoco.remove(asset)
 
-    if collision_mode == "self":
+    if collision_mode != "none":
+        # Adjacent links touch at their joints as soon as the collision proxies
+        # follow the CAD envelope instead of a sphere around it, and MuJoCo only
+        # filters direct parent/child pairs.  Both modes that generate robot
+        # contacts therefore need the exclusion list.
         contact = ET.SubElement(mujoco, "contact")
         for a, b in adjacent_excludes(joints, roots[0]):
             ET.SubElement(contact, "exclude", {"body1": a, "body2": b})

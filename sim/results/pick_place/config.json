@@ -1,0 +1,91 @@
+{
+  "height_m": 0.12,
+  "mass_kg": 0.05,
+  "model": "sim/models/r1_rebot_sim.xml",
+  "model_sha256_12": "a93599d69360",
+  "passes": [
+    "nominal"
+  ],
+  "positions": [
+    [
+      0.22,
+      0.0
+    ],
+    [
+      0.25,
+      0.05
+    ],
+    [
+      0.28,
+      -0.05
+    ],
+    [
+      0.3,
+      0.08
+    ],
+    [
+      0.24,
+      -0.08
+    ],
+    [
+      0.27,
+      0.02
+    ],
+    [
+      0.2,
+      0.06
+    ],
+    [
+      0.31,
+      -0.02
+    ],
+    [
+      0.26,
+      -0.1
+    ],
+    [
+      0.23,
+      0.09
+    ]
+  ],
+  "provenance": {
+    "arm joint limits": "official URDF (CAD)",
+    "armature 0.01 per joint": "simulation assumption (numerical conditioning)",
+    "collision proxies": "approximation - boxes fitted to each CAD collision mesh's own axis-aligned bounds, because MuJoCo replaces these non-convex meshes with bounding spheres; not CAD surfaces, and not a clearance certificate",
+    "finger joint limits (+-50 mm)": "prototype URDF (CAD travel)",
+    "finger mimic coefficient -1": "prototype URDF (CAD)",
+    "fingertip friction 0.9/0.6": "simulation assumption - rubber pads unmeasured",
+    "gripper force limit 8 N reading": "URDF effort field; NOT a measured fingertip grasp force",
+    "gripper kp / kv": "simulation assumption - no DM4310 drive characterisation",
+    "joint damping 0.2": "simulation assumption - NOT identified on hardware",
+    "link masses / inertials": "prototype URDF (author-stated estimates)",
+    "mount origin + rpy on Link7": "prototype URDF (v3 side mount, CAD-derived)",
+    "object mass / size": "experiment assumption (fixture design, not CAD)",
+    "robot base height above the floor": "SCENE CHOICE - ROBOT_BASE_Z_M; the prototype URDF has no platform geometry, and the real deck height is HARDWARE_UNVERIFIED",
+    "site (TCP/fingertip) offsets": "derived from CAD geometry at generation time",
+    "solimp/solref contact": "simulation assumption - contact stiffness unknown",
+    "work surface height": "SCENE CHOICE - TABLE_TOP_Z_M, set by the arm's measured top-down workspace band, not by CAD"
+  },
+  "samples": 60000,
+  "shapes": {
+    "bar": {
+      "shape": "box",
+      "size": [
+        0.04,
+        0.04,
+        0.12
+      ],
+      "width": 0.04
+    },
+    "cylinder": {
+      "shape": "cylinder",
+      "size": [
+        0.02,
+        0.06
+      ],
+      "width": 0.04
+    }
+  },
+  "table_top_z_m": 0.7,
+  "wall_clock_s": 0.8
+}

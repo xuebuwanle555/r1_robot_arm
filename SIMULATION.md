@@ -284,3 +284,74 @@ with deliberate intent:
 Nothing here is a grasp result: `effort = 8` in that URDF is not a measured
 grasp force, and the masses, adapter geometry and finger inertias are the source
 model's own stated assumptions.
+
+## 9. Gripper scene, collision proxies and the first pick-and-place (measured)
+
+`sim/build_gripper_model.py` generates `sim/models/r1_rebot_sim.xml` from the
+prototype URDF: 7 arm joints plus one gripper channel (8 `nu`), the two finger
+DOF kept physically separate and tied by an `mjEQ_JOINT` mimic, `tcp_site`,
+`gripper_center_site` and both fingertip sites, a work surface and free objects.
+The sources are read-only; nothing outside `sim/` is written, and the generated
+file contains no absolute paths.
+
+**Collision proxies.** MuJoCo cannot collide against these CAD meshes: every
+collision geometry in the prototype is non-convex, and the compiler silently
+replaces such a mesh with its **bounding sphere** — 19 of them, including a 38 mm
+sphere for the gripper body centred 91 mm out of its link and a 50 mm sphere for
+the base. With those proxies neither grasp clearance nor table clearance means
+anything, so the generator now emits **boxes fitted to each collision mesh's own
+axis-aligned bounds** (`collision_shape="box"`, `--collision-shape mesh` to see
+the raw meshes). Adjacent links touch at their joints as soon as the proxies
+follow the CAD envelope, so the adjacency exclusion list is emitted for every
+mode that generates robot contacts.
+
+**Scene heights are measurements, not decoration.** The URDF models the arm alone
+— no platform — so the MJCF has to decide how high it stands (`ROBOT_BASE_Z_M =
+0.75`, HARDWARE_UNVERIFIED) before a work surface means anything. Sampling 100k
+in-limit configurations and keeping those whose tool points within 25° of vertical
+*and* whose posture respects the frozen 0.05 rad soft margin puts the fingertip
+plane between 0.58 and 0.95 m. `TABLE_TOP_Z_M = 0.70` follows from that band.
+The failure modes are recorded rather than hidden: at a 0.76 m surface every
+candidate pose penetrated the bench by 27–36 mm, and asking IK for an exactly
+vertical approach at a point whose best in-limit pose tilts 18° made it trade
+position for orientation and lose by 176 mm — which is why grasp orientations are
+now taken from the sampled reachable set.
+
+**Pick-and-place: 0 / 20, and the sweep is what found the reason.**
+`sim/run_gripper_pick_place.py` runs the ten-step sequence over 10 surface
+positions for a square bar and a standing cylinder (40 mm across, 120 mm tall,
+50 g), through `R1Robot.send_action` and `Gripper.write_command` with the default
+`SafetyConfig`, and writes per-cycle telemetry to `sim/results/pick_place/`
+(`trials.csv` + `rows/*.jsonl` + `config.json` with the seed, the model hash and
+the wall clock). The measured success rate is zero, and the failure stage moved as
+the sweep ran, which is the useful part:
+
+* the first sweep failed at `6 close` - the settled finger force reached
+  0.00-0.21 N against the 0.27 N the model's own friction says a 50 g payload
+  needs - while the planned poses reported 0.0 mm of penetration and a 0.01 rad
+  "tilt". Investigating that produced two findings, both now asserted:
+  **`grasp_candidates` was filtering on the wrong sign** and was selecting poses
+  whose pads point at the sky (they still reach the target position, and with the
+  experiment objects excluded from the penetration check they look clean, but they
+  cannot grip anything); and the **fingertip sites are not the pad surfaces** - at
+  a 35.9 mm site gap across a 40 mm bar the force was 0.009 N, the site-to-pad
+  offset measuring -2 to -3 cm.
+* with the sign fixed, the current sweep fails earlier and honestly: `plan gripping
+  plane`, no clean grasp anywhere between 60 and 110 mm above the surface at those
+  ten positions. That is the state of record - after the correction there is no
+  downward, jaw-horizontal, face-aligned pose in the 60k sample set within 60 mm of
+  these targets, so what remains is to widen the search (more samples, other
+  positions, or objects the measured clearance actually allows) rather than to
+  accept a pose that cannot hold.
+
+The fixtures are chosen by that clearance: a 40 mm cube on this bench has no
+gripping plane at all, because the gripper's envelope reaches past its own
+fingertips, so the trial objects are 120 mm tall. Short objects are refused with a
+measured reason rather than grasped by cheating - no weld constraints, no object
+attachment, no teleported poses inside a trial (`SceneRig.place_arm_for_setup` is
+setup-only and is not called by the sequence).
+
+None of this transfers to hardware: friction, contact stiffness, the gripper
+gains and the 8 N channel ceiling are simulation assumptions
+(`r1_robot.gripper_mjcf.GRIPPER_PROVENANCE`), and `effort = 8` in the URDF is not
+a measured grasp force. No real R1 was connected at any point.
