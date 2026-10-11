@@ -81,3 +81,30 @@ here. Their licenses apply to your environment:
 
 Verify the exact versions and licenses in your environment with
 `pip show <pkg>` before redistribution.
+
+## Vendored CAD meshes under `sim/meshes/`
+
+`sim/build_gripper_model.py` copies the STL files referenced by the two read-only
+URDF sources into `sim/meshes/` so the generated model loads with relative paths
+on any machine.  These are **redistributed binaries**, so their provenance is
+recorded here.
+
+| Family | Source | License | Status |
+|---|---|---|---|
+| `Link*_*.stl`, R1 arm meshes | the vendored Unitree SDK submodule (`third_party/r1-7a_sdk`, `LICENSE` present, BSD-3-Clause per that file) | BSD-3-Clause | attribution reproduced above |
+| `*_finger*_*.stl`, gripper base / DM4310 meshes | reBot DevArm description package (`Rebot_Arm_description/DM/meshes/...`) | **CERN-OHL-W v2** (weakly reciprocal hardware licence) | `NOASSERTION` for software redistribution |
+
+The CERN-OHL-W grant is written for hardware designs and their associated
+documentation; it is not a standard OSI software licence, and applying it to STL
+files compiled into a simulator is not something I have verified with anyone
+competent to say.  Two practical notes before this leaves the research machine:
+
+* the source tree is unmodified and remains the reference; the staged copies are
+  regenerable, and `git rm -r sim/meshes` restores the previous state;
+* if the arm or gripper is ever shipped or offered commercially, ask whether
+  CERN-OHL-W requires published design source for the derived physical hardware.
+  Nothing in this repository builds hardware.
+
+`sim/meshes/manifest.json` (written by the generator) records each staged file's
+original absolute path and SHA-256, so a review can prove which CAD a given
+binary came from.

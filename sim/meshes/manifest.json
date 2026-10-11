@@ -1,0 +1,108 @@
+{
+  "meshes": {
+    "Link1_8c4c876e.stl": {
+      "sha256": "e766084eb972536eed974f4361028cb51e4b35d0036f152e9bf215c5d62775c0",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/Link1.STL"
+    },
+    "Link2_7bdc8618.stl": {
+      "sha256": "d6d9d9aed7c73e837bec198827440533ed5db0fce80e9a7531e9c8b2993720ac",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/Link2.STL"
+    },
+    "Link3_f6e78c2b.stl": {
+      "sha256": "04870db8eba1cd4ef8f601050586caf63d07e79a053e626438703c453c496778",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/Link3.STL"
+    },
+    "Link4_7cbb9817.stl": {
+      "sha256": "c90c7435eadb9cb54a8316666dfbd6eafdbb5fb3e2f32f3f5df3b6757ec06d4c",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/Link4.STL"
+    },
+    "Link5_44fcfb81.stl": {
+      "sha256": "4a13ea7e4626827727c0b3a207a8ebd2a6576cde7d52cb14a00317e1b7e2fd00",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/Link5.STL"
+    },
+    "Link6_676c2c16.stl": {
+      "sha256": "10dbf195931d1c2e80672cb5e0572e1fc60925a99b563660833f45a5d04e2c77",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/Link6.STL"
+    },
+    "Link7_29aef3d7.stl": {
+      "sha256": "f0b2a96dcb3e7c28f02d404af39c7caceeb6404e8df21c272561c3e08210598d",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/Link7.STL"
+    },
+    "base_link_f6060e3d.stl": {
+      "sha256": "75124b266168a63131a737e4d50a497476384d0481a451c4be25bab2568e76ed",
+      "source": "/home/jesse/r1_robot/third_party/r1-7a_sdk/urdf/R1_Robotic_Arm_V1.1-0915/R1_Robotic_Arm_V1.1_0915/R1_Robotic_Arm/meshes/base_link.STL"
+    },
+    "colored_gripper_base_hardware_black_668b63e9.stl": {
+      "sha256": "9e89b784b7db552d5fea7c5f57a8317f4d23ace19e594bb59e18ada37471569e",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/visual/colored_gripper_base_hardware_black.stl"
+    },
+    "colored_gripper_base_metal_f922e92f.stl": {
+      "sha256": "ac9032a968febcca070696e3f75f10d98727eb74548f1e502428a9b89ffdb187",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/visual/colored_gripper_base_metal.stl"
+    },
+    "colored_gripper_base_seeed_yellow_b5a9f4f9.stl": {
+      "sha256": "5632650c7506d5ea9699fd7fee674c937ec764f98ce2123d80a5094d94c2e6f1",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/visual/colored_gripper_base_seeed_yellow.stl"
+    },
+    "colored_left_finger_carriage_grey_a89c1a53.stl": {
+      "sha256": "f650b231f1d366e0413db8bd4f6e9925442fb576841914aad57dde5a9bae5c46",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/shared/colored_left_finger_carriage_grey.stl"
+    },
+    "colored_left_finger_finger_black_5d739a64.stl": {
+      "sha256": "5473c38c7de9d4c8297e0a5134c14cfc8f9d6376b5d8257931ba4ae1b1e3dcda",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/visual/colored_left_finger_finger_black.stl"
+    },
+    "colored_left_finger_rack_metal_93074bde.stl": {
+      "sha256": "938e863507227a7dd96bd4bb2196a7b3361b2718c44cd39bc2ffc39482ab5455",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/visual/colored_left_finger_rack_metal.stl"
+    },
+    "colored_left_finger_travel_stop_yellow_a6237f15.stl": {
+      "sha256": "2fdf7c97d0388fe3c8a5fe2408a1d97201243be729cb1f7a3b56c3916c92da53",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/shared/colored_left_finger_travel_stop_yellow.stl"
+    },
+    "colored_right_finger_carriage_grey_d915253a.stl": {
+      "sha256": "efa43d88c9bed0a66ac84a9cf26ac1c5326178dc93b4a01e0e1dbfa5b4430d22",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/shared/colored_right_finger_carriage_grey.stl"
+    },
+    "colored_right_finger_finger_black_bbdc068a.stl": {
+      "sha256": "caf83c51fb2d98cba27414ba903297a76f0bdbc22513b3e97b3cff44ecb80693",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/visual/colored_right_finger_finger_black.stl"
+    },
+    "colored_right_finger_rack_metal_01014c34.stl": {
+      "sha256": "0ae753bbf754c48ad918195c310735a397ae4d0d8250297af1ef3afe65d6d9f5",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/visual/colored_right_finger_rack_metal.stl"
+    },
+    "colored_right_finger_travel_stop_yellow_bf9313f1.stl": {
+      "sha256": "1d28609e4761077beac32d127aaefa23ffb1a615de766ce0b71256344f735e0b",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/shared/colored_right_finger_travel_stop_yellow.stl"
+    },
+    "gripper_base_3f0d5d8b.stl": {
+      "sha256": "5e7b0473acaf31fc5c511a3591311e6561ad6066af8e135e21e18c096e1e7da5",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/collision/gripper_base.stl"
+    },
+    "left_finger_front_cb1f849c.stl": {
+      "sha256": "936693f1bb04d9804eaf3acb372decd441114a9fd86bd0d9ee4b7809b45388fc",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/mujoco_collision/left_finger_front.stl"
+    },
+    "left_finger_mid_062ac11f.stl": {
+      "sha256": "b6edbec6b4bdbee3b5f828b22782fb7cff9f7db97d1af1c2e1c48da246d7fb1c",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/mujoco_collision/left_finger_mid.stl"
+    },
+    "left_finger_rear_f953b3b5.stl": {
+      "sha256": "06bdb9aafaf8b2d0f852627e4de35400cf4e6333a9f5221b294d03cb4831f069",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/mujoco_collision/left_finger_rear.stl"
+    },
+    "right_finger_front_75b2d455.stl": {
+      "sha256": "07a6f2151d34578f11d52a9ff62f0ac73187059a57a5a444608bd4b59d71de2c",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/mujoco_collision/right_finger_front.stl"
+    },
+    "right_finger_mid_4918d9de.stl": {
+      "sha256": "75850c41f902f73424e18ce21c1bf3a07597f4b5a5bfbb7bb8be40874fe78ff2",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/mujoco_collision/right_finger_mid.stl"
+    },
+    "right_finger_rear_00b7198f.stl": {
+      "sha256": "69a9bd9e6e9f22b12c71e79522174b8f7bac408ba8610a27f167801727d99065",
+      "source": "/home/jesse/Downloads/reBot-DevArm-main/Rebot_Arm_description/DM/meshes/mujoco_collision/right_finger_rear.stl"
+    }
+  }
+}
